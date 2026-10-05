@@ -30,6 +30,31 @@ previous ones.
 Each patch's commit message explains the change in detail. Patches 1 and 2 are the important
 ones. 3 and 4 help any language binding. 5 to 8 make training and quantization behave like C++.
 
+### Not in the series yet: fixes from fuzzing
+
+The vendored crate has more changes than the nine patches above (they are in
+`vendor/fasttext-0.8.0-fixes.patch`, but `scripts/make_upstream_series.py` does not assign them
+to a patch yet, so it currently stops with "unassigned hunks"). They came from fuzzing the
+crate through the bindings (`fuzz/`) and would make three more patches:
+
+* **Robust model loading.** A `ModelReader` checks every size declared in a model file
+  (dictionary entries, pruned index, dense matrix `m x n`, quantized codes and norm codes,
+  product-quantizer centroids) against the bytes left in the file before allocating, and reads
+  arrays in chunks when the length is unknown. After loading, the shapes that prediction relies
+  on are validated (`size == nwords + nlabels`, words before labels, input rows cover
+  `nwords + bucket` or the pruned rows, one output row per label / word, consistent product
+  quantizers, bounded `dim` / `maxn` / `wordNgrams`, bounded n-gram expansion, non-degenerate
+  hierarchical-softmax tree). Plus: an iterative HS DFS (deep trees overflowed the stack), no
+  Huffman tree for zero labels (`2 * 0 - 1` wrapped to a huge allocation), a Huffman build that
+  no longer reads past the node array when a count exceeds the sentinel, NaN-safe sorts
+  (`sort_by` panics on non-total orders since Rust 1.81), out-of-range input ids that add
+  nothing (a label's own id), `.vec` parsing like C++ `operator>>` and without NUL bytes in
+  words, a consistent pruned-index size, and a clamped nearest-neighbour `k`.
+* **windows-gnu math.** `expf` / `log` come from `ucrtbase.dll` on `windows-gnu`: mingw-w64's
+  libm `expf` is about 15x slower, which made softmax training 2.5x slower than on Linux.
+* **Smaller vocabulary table for training.** The hash table is sized to the input file instead of
+  always 30M slots (same vocabulary; much faster on small inputs).
+
 ### How it was verified
 
 * **Crate tests:** `scripts/make_upstream_series.py --test` runs `cargo test --release` (455
@@ -150,9 +175,12 @@ These are worked around in the bindings (`src/model.rs`) rather than patched in 
 * `get_ngram_strings` leaves out the strings of n-grams pruned from a quantized model. C++
   lists every n-gram string, but only the surviving ids.
 * C++ quirk, for reference: with `thread < 10`, C++ `DenseMatrix::uniform` initialises only the
-  first `thread` tenths of the input matrix and leaves the rest at zero. Measured with
-  `thread=4`: 40% non-zero. The crate initialises everything. This likely explains why some
-  losses (hs, ns) train about 1 point of P@1 *better* here than in C++ on cooking.stackexchange.
+  first `thread` tenths of the input matrix (blocks of `rows * dim / 10` values), and the C++
+  package allocates the matrix uninitialised (`intgemm::AlignedVector`). The rest is therefore
+  whatever was in that memory: zero for large matrices (fresh pages), heap garbage for small
+  ones, which is why the C++ trainer sporadically fails tiny runs with "Encountered NaN". The
+  crate initialises everything. This likely explains why some losses (hs, ns) train about 1
+  point of P@1 *better* here than in C++ on cooking.stackexchange.
 
 ## About the Python bindings
 

@@ -1,6 +1,6 @@
 diff -ru a/src/dictionary.rs b/src/dictionary.rs
 --- a/src/dictionary.rs	2006-07-23 21:21:28.000000000 -0400
-+++ b/src/dictionary.rs	2026-10-04 23:53:25.570698900 -0400
++++ b/src/dictionary.rs	2026-10-05 16:26:08.124611500 -0400
 @@ -1,6 +1,32 @@
  // Dictionary: tokenization, vocabulary, subwords, word n-grams, hash table
  
@@ -292,10 +292,112 @@ diff -ru a/src/dictionary.rs b/src/dictionary.rs
          if pruneidx_size > 0 {
              for _ in 0..pruneidx_size {
                  let first = utils::read_i32(reader)?;
+@@ -1135,25 +1204,83 @@
+     ///
+     /// After loading, initializes discard table, n-grams, and rebuilds word2int.
+     pub fn load_from_reader<R: Read>(reader: &mut R, args: Arc<Args>) -> Result<Self> {
++        Self::load_from(&mut utils::ModelReader::new(reader, None), args)
++    }
++
++    /// [fasttext-python-bindings patch] [`Self::load_from_reader`] with the declared sizes
++    /// checked against the bytes left in the file before anything is allocated, and the
++    /// structure the rest of the crate relies on validated: `size == nwords + nlabels`, the
++    /// `nwords` words first and then the labels (C++ `threshold` order), non-negative
++    /// `pruneidx` rows, and a bounded number of precomputed character n-grams.
++    pub fn load_from<R: Read>(reader: &mut utils::ModelReader<R>, args: Arc<Args>) -> Result<Self> {
+         let size = utils::read_i32(reader)?;
+         let nwords = utils::read_i32(reader)?;
+         let nlabels = utils::read_i32(reader)?;
+         let ntokens = utils::read_i64(reader)?;
+         let pruneidx_size = utils::read_i64(reader)?;
+ 
+-        if size < 0 || nwords < 0 || nlabels < 0 {
++        if size < 0 || nwords < 0 || nlabels < 0 || size as i64 != nwords as i64 + nlabels as i64 {
+             return Err(FastTextError::InvalidModel(format!(
+                 "Invalid dictionary dimensions: size={}, nwords={}, nlabels={}",
+                 size, nwords, nlabels
+             )));
+         }
++        // An entry is at least a NUL terminator, an i64 count and a type byte.
++        reader.ensure(size as u64, 10, "dictionary")?;
+ 
+-        let mut words = Vec::with_capacity(size as usize);
+-        for _ in 0..size {
+-            words.push(Self::read_entry_from_reader(reader)?);
++        let mut words = Vec::with_capacity((size as usize).min(1 << 16));
++        for i in 0..size {
++            let entry = Self::read_entry_from_reader(reader)?;
++            let expected = if i < nwords {
++                EntryType::Word
++            } else {
++                EntryType::Label
++            };
++            if entry.entry_type != expected {
++                return Err(FastTextError::InvalidModel(format!(
++                    "Invalid dictionary: entry {} is a {:?} but the first {} entries must be \
++                     words and the rest labels",
++                    i, entry.entry_type, nwords
++                )));
++            }
++            words.push(entry);
+         }
+ 
++        if pruneidx_size > 0 {
++            reader.ensure(pruneidx_size as u64, 8, "pruned n-gram index")?;
++        }
+         let pruneidx = Self::read_pruneidx(reader, pruneidx_size)?;
++        // Duplicate keys collapse in the map; keep the count consistent with it so that the
++        // model saves a file that loads again.
++        let pruneidx_size = if pruneidx_size > 0 {
++            pruneidx.len() as i64
++        } else {
++            pruneidx_size
++        };
++        if pruneidx.values().any(|&v| v < 0) {
++            return Err(FastTextError::InvalidModel(
++                "Invalid dictionary: negative row in the pruned n-gram index".to_string(),
++            ));
++        }
++
++        // `init_ngrams` stores every character n-gram id of every word; bound that work and
++        // memory (a long word with a huge `maxn` is quadratic) relative to the file size.
++        if args.maxn > 0 && args.bucket > 0 {
++            let maxn = args.maxn as u64;
++            let budget = 16 * reader.len_or_position() + (1 << 26);
++            let mut total = 0u64;
++            for e in &words {
++                let nchars = e.bytes().iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u64 + 2;
++                total = total.saturating_add(nchars.saturating_mul(nchars.min(maxn)));
++            }
++            if total > budget {
++                return Err(FastTextError::InvalidModel(format!(
++                    "Invalid model: the dictionary would expand to about {} character n-grams \
++                     (maxn={})",
++                    total, args.maxn
++                )));
++            }
++        }
+ 
+         let mut dict = Dictionary::new_with_capacity(args, 1);
+         dict.words = words;
 diff -ru a/src/fasttext/mod.rs b/src/fasttext/mod.rs
 --- a/src/fasttext/mod.rs	2006-07-23 21:21:28.000000000 -0400
-+++ b/src/fasttext/mod.rs	2026-10-04 23:16:55.669464400 -0400
-@@ -120,6 +120,9 @@
++++ b/src/fasttext/mod.rs	2026-10-05 15:54:31.259736100 -0400
+@@ -26,6 +26,13 @@
+ pub const FASTTEXT_FILEFORMAT_MAGIC_INT32: i32 = 793712314;
+ /// Current binary format version.
+ pub const FASTTEXT_VERSION: i32 = 12;
++/// [fasttext-python-bindings patch] Largest `dim` accepted in a model file.
++const MAX_LOADED_DIM: i32 = 1 << 16;
++/// [fasttext-python-bindings patch] Largest `maxn` / `wordNgrams` accepted in a model file.
++const MAX_LOADED_NGRAM: i32 = 256;
++/// [fasttext-python-bindings patch] Deepest hierarchical-softmax tree accepted in a model file
++/// (Huffman trees over positive counts that fit in an `i64` are at most ~92 levels deep).
++const MAX_HS_DEPTH: usize = 128;
+ 
+ /// A handle to an in-flight training run spawned by [`FastText::spawn_training`].
+ ///
+@@ -120,6 +127,9 @@
      /// When `Some`, records the average loss after each completed epoch.
      /// Best used with `thread=1` for accurate epoch boundaries.
      pub(super) epoch_loss_tracker: Option<Arc<Mutex<Vec<f32>>>>,
@@ -305,7 +407,7 @@ diff -ru a/src/fasttext/mod.rs b/src/fasttext/mod.rs
  }
  
  /// Result of loading input and output matrices from binary format.
-@@ -167,6 +170,10 @@
+@@ -167,6 +177,10 @@
      /// Cached sigmoid/log lookup tables for quantized prediction.
      /// Shared with loss instances via `Arc` to avoid redundant allocations.
      pub(super) loss_tables: Arc<LossTables>,
@@ -316,7 +418,82 @@ diff -ru a/src/fasttext/mod.rs b/src/fasttext/mod.rs
  }
  
  impl FastText {
-@@ -302,6 +309,7 @@
+@@ -195,13 +209,16 @@
+     ///
+     /// Reads: quant_input flag, input matrix, qout flag, output matrix.
+     /// Returns `(input_dense, input_quant, qout, output_dense, output_quant)`.
+-    fn load_matrices<R: Read>(reader: &mut R, dict: &Dictionary) -> Result<LoadedMatrices> {
++    fn load_matrices<R: Read>(
++        reader: &mut utils::ModelReader<R>,
++        dict: &Dictionary,
++    ) -> Result<LoadedMatrices> {
+         let quant_input = utils::read_bool(reader)?;
+ 
+         let (input_dense, input_quant) = if !quant_input {
+-            (DenseMatrix::load(reader)?, None)
++            (DenseMatrix::load_from(reader)?, None)
+         } else {
+-            let qm = QuantMatrix::load(reader)?;
++            let qm = QuantMatrix::load_from(reader)?;
+             (DenseMatrix::new(0, 0), Some(qm))
+         };
+ 
+@@ -217,10 +234,10 @@
+         let qout = utils::read_bool(reader)?;
+ 
+         let (output_dense, output_quant) = if quant_input && qout {
+-            let qm = QuantMatrix::load(reader)?;
++            let qm = QuantMatrix::load_from(reader)?;
+             (DenseMatrix::new(0, 0), Some(qm))
+         } else {
+-            (DenseMatrix::load(reader)?, None)
++            (DenseMatrix::load_from(reader)?, None)
+         };
+ 
+         Ok(LoadedMatrices {
+@@ -267,6 +284,23 @@
+     /// 7. qout (bool → stored in args.qout)
+     /// 8. Output matrix
+     pub fn load<R: Read>(reader: &mut R) -> Result<Self> {
++        Self::load_from(&mut utils::ModelReader::new(reader, None))
++    }
++
++    /// [fasttext-python-bindings patch] Load a model from an in-memory `.bin` / `.ftz` image.
++    pub fn load_from_bytes(bytes: &[u8]) -> Result<Self> {
++        Self::load_from(&mut utils::ModelReader::new(
++            bytes,
++            Some(bytes.len() as u64),
++        ))
++    }
++
++    /// [fasttext-python-bindings patch] [`Self::load`] hardened against corrupt or malicious
++    /// files: every size declared in the file is checked against the bytes that remain before
++    /// it is allocated (when the length is known), and the loaded parts are checked for the
++    /// consistency that prediction relies on ([`Self::validate_loaded`]), so a bad file gives
++    /// `InvalidModel` instead of a panic, an out-of-bounds access or a huge allocation.
++    fn load_from<R: Read>(reader: &mut utils::ModelReader<R>) -> Result<Self> {
+         let version = Self::validate_header(reader)?;
+ 
+         // Read Args block with backward compatibility
+@@ -275,14 +309,16 @@
+         if version == 11 && args.model == ModelName::Supervised {
+             args.maxn = 0;
+         }
++        Self::validate_loaded_args(&args)?;
+ 
+         // Read Dictionary block
+-        let dict = Dictionary::load_from_reader(reader, Arc::new(args.clone()))?;
++        let dict = Dictionary::load_from(reader, Arc::new(args.clone()))?;
+ 
+         // Read matrices (input, output, quant flags)
+         let matrices = Self::load_matrices(reader, &dict)?;
+         args.qout = matrices.qout;
+         let quant = matrices.input_quant.is_some();
++        Self::validate_loaded(&args, &dict, &matrices, reader.len_or_position())?;
+ 
+         // Build inference model
+         let input = Arc::new(matrices.input_dense);
+@@ -302,14 +338,127 @@
              abort_flag: Arc::new(AtomicBool::new(false)),
              last_train_loss: 0.0,
              loss_tables,
@@ -324,25 +501,152 @@ diff -ru a/src/fasttext/mod.rs b/src/fasttext/mod.rs
          })
      }
  
-@@ -410,6 +418,28 @@
++    /// [fasttext-python-bindings patch] Arguments of a loaded model that inference relies on.
++    /// The bounds are far above anything fastText is used with (C++ defaults: dim 100, maxn 6,
++    /// wordNgrams 1-5) and keep the per-token work and per-call buffers bounded.
++    fn validate_loaded_args(args: &Args) -> Result<()> {
++        let check = |what: &str, v: i32, ok: bool| {
++            if ok {
++                Ok(())
++            } else {
++                Err(FastTextError::InvalidModel(format!(
++                    "Invalid model: {what} = {v} is out of range"
++                )))
++            }
++        };
++        check("dim", args.dim, (1..=MAX_LOADED_DIM).contains(&args.dim))?;
++        check("bucket", args.bucket, args.bucket >= 0)?;
++        check("maxn", args.maxn, args.maxn <= MAX_LOADED_NGRAM)?;
++        check(
++            "wordNgrams",
++            args.word_ngrams,
++            args.word_ngrams <= MAX_LOADED_NGRAM,
++        )
++    }
++
++    /// [fasttext-python-bindings patch] Shape checks after loading (C++ trusts the file):
++    ///
++    /// * every row id the dictionary can produce (`nwords + bucket`, or the pruned n-gram
++    ///   rows) exists in the input matrix, which has `dim` columns;
++    /// * the output matrix has one row per label (supervised) or word (cbow / skipgram);
++    /// * matrices dequantized or precomputed later (`qout` output for hs / ns, normalized
++    ///   word vectors) stay proportional to the file size;
++    /// * the hierarchical-softmax tree built from the counts is not degenerate.
++    fn validate_loaded(
++        args: &Args,
++        dict: &Dictionary,
++        m: &LoadedMatrices,
++        file_len: u64,
++    ) -> Result<()> {
++        let err = |msg: String| Err(FastTextError::InvalidModel(msg));
++        let dim = args.dim as i64;
++        let nwords = dict.nwords() as i64;
++        let nlabels = dict.nlabels() as i64;
++        if nwords + args.bucket as i64 > i32::MAX as i64 {
++            return err(format!(
++                "Invalid model: nwords + bucket = {} does not fit in 32 bits",
++                nwords + args.bucket as i64
++            ));
++        }
++        let needed_rows = if dict.is_pruned() {
++            let max_row = dict.pruneidx().values().map(|&v| v as i64 + 1).max();
++            nwords + max_row.unwrap_or(0)
++        } else {
++            nwords + args.bucket as i64
++        };
++        let (in_rows, in_cols) = match &m.input_quant {
++            Some(q) => (q.rows(), q.cols()),
++            None => (m.input_dense.rows(), m.input_dense.cols()),
++        };
++        if in_cols != dim || in_rows < needed_rows {
++            return err(format!(
++                "Invalid model: input matrix is {in_rows}x{in_cols}, expected at least \
++                 {needed_rows}x{dim} (nwords={nwords}, bucket={})",
++                args.bucket
++            ));
++        }
++        let out_rows_expected = if args.model == ModelName::Supervised {
++            nlabels
++        } else {
++            nwords
++        };
++        let (out_rows, out_cols) = match &m.output_quant {
++            Some(q) => (q.rows(), q.cols()),
++            None => (m.output_dense.rows(), m.output_dense.cols()),
++        };
++        if out_cols != dim || out_rows != out_rows_expected {
++            return err(format!(
++                "Invalid model: output matrix is {out_rows}x{out_cols}, expected \
++                 {out_rows_expected}x{dim}"
++            ));
++        }
++        // Derived dense matrices: a quantized file stores about one byte per `dsub` values.
++        let budget = 64u64.saturating_mul(file_len).saturating_add(256 << 20);
++        let derived = |rows: i64| (rows.max(0) as u64).saturating_mul(dim as u64 * 4);
++        if m.input_quant.is_some() && derived(nwords) > budget {
++            return err(format!(
++                "Invalid model: {nwords} words x {dim} dimensions is too large for a \
++                 {file_len}-byte quantized model"
++            ));
++        }
++        if m.output_quant.is_some() && derived(out_rows) > budget {
++            return err(format!(
++                "Invalid model: a {out_rows}x{dim} quantized output matrix is too large for a \
++                 {file_len}-byte model"
++            ));
++        }
++        if args.loss == LossName::HierarchicalSoftmax {
++            let counts = if args.model == ModelName::Supervised {
++                dict.get_counts(EntryType::Label)
++            } else {
++                dict.get_counts(EntryType::Word)
++            };
++            let depth = crate::loss::huffman_max_depth(&counts);
++            if depth > MAX_HS_DEPTH {
++                return err(format!(
++                    "Invalid model: the hierarchical-softmax tree built from the counts is \
++                     {depth} levels deep (corrupt counts?)"
++                ));
++            }
++        }
++        Ok(())
++    }
++
+     /// Load a model from a file path.
+     pub fn load_model(path: impl AsRef<Path>) -> Result<Self> {
+         let file = std::fs::File::open(path).map_err(FastTextError::IoError)?;
+-        let mut reader = BufReader::new(file);
+-        Self::load(&mut reader)
++        // [fasttext-python-bindings patch] The file length bounds every declared size.
++        let len = file.metadata().map(|m| m.len()).ok();
++        Self::load_from(&mut utils::ModelReader::new(BufReader::new(file), len))
+     }
+ 
+     /// Save the model to a binary writer.
+@@ -410,6 +559,33 @@
          self.quant_output.as_ref()
      }
  
 +    /// [fasttext-python-bindings patch] Add the input-matrix rows `ids` to `out`
 +    /// (C++ `FastText::addInputVector`), for dense and quantized models alike.
 +    ///
++    /// Ids outside the matrix add nothing: a label's own id (`nwords + label index`, which C++
++    /// `getWordVector("__label__x")` also reads) is past the last row when the model has fewer
++    /// buckets than labels, e.g. `bucket = 0`; C++ reads out of bounds there.
++    ///
 +    /// # Panics
-+    /// Panics if `out.len()` differs from the model dimension or an id is out of range.
++    /// Panics if `out.len()` differs from the model dimension.
 +    pub fn add_input_rows(&self, ids: &[i32], out: &mut [f32]) {
 +        if let Some(ref qi) = self.quant_input {
 +            let mut v = Vector::new(out.len());
 +            v.data_mut().copy_from_slice(out);
-+            for &id in ids {
++            for &id in ids.iter().filter(|&&id| id >= 0 && (id as i64) < qi.rows()) {
 +                qi.add_row_to_vector(&mut v, id, 1.0);
 +            }
 +            out.copy_from_slice(v.data());
 +        } else {
-+            for &id in ids {
++            let rows = self.input.rows();
++            for &id in ids.iter().filter(|&&id| id >= 0 && (id as i64) < rows) {
 +                for (o, &x) in out.iter_mut().zip(self.input.row(id as i64)) {
 +                    *o += x;
 +                }
@@ -353,6 +657,36 @@ diff -ru a/src/fasttext/mod.rs b/src/fasttext/mod.rs
      /// Return the word vector for a given word.
      ///
      /// For in-vocabulary words the vector is the average of all stored subword
+diff -ru a/src/fasttext/nn.rs b/src/fasttext/nn.rs
+--- a/src/fasttext/nn.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/fasttext/nn.rs	2026-10-05 15:54:16.209356000 -0400
+@@ -189,6 +189,9 @@
+         k: usize,
+         ban_words: &[&str],
+     ) -> Vec<(f32, String)> {
++        // [fasttext-python-bindings patch] `k` comes from the caller (e.g. Python); never
++        // reserve more than the vocabulary (`k + 1` also overflowed for `usize::MAX`).
++        let k = k.min(self.dict.nwords().max(0) as usize);
+         if k == 0 {
+             return Vec::new();
+         }
+@@ -227,7 +230,15 @@
+             .into_iter()
+             .map(|Reverse((OrdF32(sim), i))| (sim, self.dict.get_word(i as i32).to_string()))
+             .collect();
+-        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
++        // [fasttext-python-bindings patch] NaN similarities (a model file with NaN weights)
++        // made the comparator inconsistent, which panics in `sort_by` since Rust 1.81. Rank
++        // NaN last; every other comparison is unchanged.
++        let key = |x: f32| if x.is_nan() { f32::NEG_INFINITY } else { x };
++        results.sort_by(|a, b| {
++            key(b.0)
++                .partial_cmp(&key(a.0))
++                .unwrap_or(std::cmp::Ordering::Equal)
++        });
+         results
+     }
+ }
 diff -ru a/src/fasttext/predict.rs b/src/fasttext/predict.rs
 --- a/src/fasttext/predict.rs	2006-07-23 21:21:28.000000000 -0400
 +++ b/src/fasttext/predict.rs	2026-10-04 23:14:46.610455500 -0400
@@ -623,7 +957,7 @@ diff -ru a/src/fasttext/quantize.rs b/src/fasttext/quantize.rs
      }
 diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
 --- a/src/fasttext/train.rs	2006-07-23 21:21:28.000000000 -0400
-+++ b/src/fasttext/train.rs	2026-10-04 23:53:25.281680400 -0400
++++ b/src/fasttext/train.rs	2026-10-05 15:54:31.282031400 -0400
 @@ -1,9 +1,8 @@
  use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
  use std::path::Path;
@@ -645,7 +979,34 @@ diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
      /// 4. Return a trained `FastText` instance.
      pub fn train_with_abort(args: Args, abort_flag: Arc<AtomicBool>) -> Result<Self> {
          Self::train_internal(args, abort_flag, None)
-@@ -129,6 +128,7 @@
+@@ -101,7 +100,25 @@
+     /// Validates that the file is non-empty and, for supervised models,
+     /// that at least one label is present.
+     fn build_vocabulary(args: &Args, args_arc: &Arc<Args>) -> Result<Dictionary> {
+-        let mut dict = Dictionary::new(Arc::clone(args_arc));
++        // [fasttext-python-bindings patch] Size the vocabulary hash table to the input instead
++        // of always allocating C++'s 30M slots (120 MB, filled on every call). A file of `n`
++        // bytes has at most `n / 2 + 1` distinct tokens, so a table of `2n` slots (plus the
++        // pretrained-vector words) never reaches the 75% pruning point of `read_from_file`,
++        // exactly like the 30M table: same vocabulary, much faster on small files.
++        let file_len = |p: &Path| {
++            std::fs::metadata(p)
++                .map(|m| m.len())
++                .unwrap_or(u64::MAX / 4)
++        };
++        let mut bytes = file_len(&args.input);
++        if !args.pretrained_vectors.as_os_str().is_empty() {
++            bytes = bytes.saturating_add(file_len(&args.pretrained_vectors));
++        }
++        let capacity = bytes
++            .saturating_mul(2)
++            .saturating_add(1024)
++            .min(crate::dictionary::MAX_VOCAB_SIZE as u64) as usize;
++        let mut dict = Dictionary::new_with_capacity(Arc::clone(args_arc), capacity);
+         {
+             let file = std::fs::File::open(&args.input).map_err(FastTextError::IoError)?;
+             let mut reader = BufReader::new(file);
+@@ -129,6 +146,7 @@
      fn initialize_matrices(
          args: &Args,
          dict: &Dictionary,
@@ -653,7 +1014,7 @@ diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
      ) -> Result<(Arc<DenseMatrix>, Arc<DenseMatrix>)> {
          let nwords = dict.nwords() as i64;
          let bucket = args.bucket as i64;
-@@ -137,8 +137,15 @@
+@@ -137,8 +155,15 @@
          let input = Arc::new({
              let mut m = DenseMatrix::new(nwords + bucket, dim);
              m.uniform(1.0 / args.dim as f32, args.seed);
@@ -671,7 +1032,7 @@ diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
              }
              m
          });
-@@ -187,38 +194,129 @@
+@@ -187,38 +212,129 @@
          let token_count = AtomicI64::new(0);
          let shared_loss = AtomicU64::new(f64::to_bits(0.0));
          let shared_loss_count = AtomicI64::new(0);
@@ -824,7 +1185,7 @@ diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
      /// Internal training implementation with optional epoch loss tracking.
      fn train_internal(
          args: Args,
-@@ -232,8 +330,32 @@
+@@ -232,8 +348,32 @@
          }
  
          let args_arc = Arc::new(args.clone());
@@ -859,7 +1220,7 @@ diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
          let loss_tables = Arc::new(LossTables::new());
  
          let avg_loss = Self::run_hogwild_training(
-@@ -260,6 +382,7 @@
+@@ -260,6 +400,7 @@
              abort_flag,
              last_train_loss: avg_loss,
              loss_tables,
@@ -867,7 +1228,7 @@ diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
          })
      }
  
-@@ -326,15 +449,8 @@
+@@ -326,19 +467,23 @@
          Ok((n, vec_dim))
      }
  
@@ -880,12 +1241,28 @@ diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
 -        dict: &Dictionary,
 -        input: &mut DenseMatrix,
 -    ) -> Result<()> {
+-        let mut parts = line.split_whitespace();
 +    /// Parse one line of a `.vec` file into `(word, vector)`.
 +    fn parse_pretrained_line(line: &str, dim: usize) -> Result<(String, Vec<f32>)> {
-         let mut parts = line.split_whitespace();
++        // [fasttext-python-bindings patch] Split on the C `isspace` set like C++ `operator>>`
++        // (`split_whitespace` also split words on Unicode spaces such as U+00A0).
++        let mut parts = line
++            .split([' ', '\t', '\n', '\r', '\x0b', '\x0c'])
++            .filter(|p| !p.is_empty());
          let word = parts.next().ok_or_else(|| {
              FastTextError::InvalidModel("Missing word in pretrained vectors line".to_string())
-@@ -360,26 +476,15 @@
+         })?;
++        // [fasttext-python-bindings patch] A NUL byte cannot be part of a fastText word (the
++        // model file stores words NUL-terminated, so saving it would corrupt the model).
++        if word.contains('\0') {
++            return Err(FastTextError::InvalidModel(
++                "Invalid word (contains a NUL byte) in pretrained vectors".to_string(),
++            ));
++        }
+ 
+         let mut vec = Vec::with_capacity(dim);
+         for j in 0..dim {
+@@ -360,26 +505,15 @@
              vec.push(val);
          }
  
@@ -915,15 +1292,16 @@ diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
          let file = std::fs::File::open(path).map_err(FastTextError::IoError)?;
          let reader = std::io::BufReader::new(file);
          let mut lines = reader.lines();
-@@ -394,6 +499,7 @@
+@@ -394,6 +528,8 @@
          let (n, vec_dim) = Self::parse_vec_header(&header, args.dim)?;
          let dim = vec_dim as usize;
  
-+        let mut out = Vec::with_capacity(n.max(0) as usize);
++        // [fasttext-python-bindings patch] `n` comes from the file: don't reserve for it.
++        let mut out = Vec::with_capacity(n.clamp(0, 1 << 16) as usize);
          for _ in 0..n {
              let line = lines
                  .next()
-@@ -401,10 +507,10 @@
+@@ -401,10 +537,10 @@
                      FastTextError::InvalidModel("Pretrained vectors file is truncated".to_string())
                  })?
                  .map_err(FastTextError::IoError)?;
@@ -936,7 +1314,7 @@ diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
      }
  
      /// Signal an in-progress training run to stop early.
-@@ -615,6 +721,10 @@
+@@ -615,6 +751,10 @@
                  ctx.token_count
                      .fetch_add(local_token_count, Ordering::Relaxed);
                  local_token_count = 0;
@@ -949,7 +1327,7 @@ diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
  
 diff -ru a/src/loss.rs b/src/loss.rs
 --- a/src/loss.rs	2006-07-23 21:21:28.000000000 -0400
-+++ b/src/loss.rs	2026-10-04 21:28:31.413911500 -0400
++++ b/src/loss.rs	2026-10-05 15:54:31.301129600 -0400
 @@ -19,7 +19,7 @@
  
  use crate::matrix::{DenseMatrix, Matrix};
@@ -970,7 +1348,7 @@ diff -ru a/src/loss.rs b/src/loss.rs
  #[inline]
  pub fn std_log(x: f32) -> f32 {
 -    (x + 1e-5_f32).ln()
-+    ((x as f64) + 1e-5).ln() as f32
++    crate::utils::ln((x as f64) + 1e-5) as f32
 +}
 +
 +// [fasttext-python-bindings patch] libstdc++-compatible binary heap.
@@ -1101,44 +1479,143 @@ diff -ru a/src/loss.rs b/src/loss.rs
  }
  
  // BinaryLogisticBase — shared helper for OVA, NS, HS
-@@ -567,28 +639,27 @@
-         if score < log_threshold {
-             return;
-         }
--        if heap.len() == k && !heap.is_empty() && score < heap.last().unwrap().0 {
-+        // [fasttext-python-bindings patch] libstdc++ heap, exactly like C++ `dfs`.
-+        if heap.len() == k && !heap.is_empty() && score < heap[0].0 {
-             return;
-         }
+@@ -493,6 +565,11 @@
  
-         let n = &self.tree[node];
-         if n.left == -1 && n.right == -1 {
+     /// Build the Huffman tree nodes from frequency counts.
+     fn build_huffman_nodes(&mut self, counts: &[i64]) {
++        // [fasttext-python-bindings patch] `2 * 0 - 1` wrapped to a huge allocation.
++        if self.osz <= 0 {
++            self.tree = Vec::new();
++            return;
++        }
+         let n = (2 * self.osz - 1) as usize;
+         self.tree = vec![
+             HsNode {
+@@ -515,7 +592,13 @@
+             let i = i as usize;
+             let mut mini = [0i32; 2];
+             for mini_j in mini.iter_mut().take(2) {
+-                if leaf >= 0 && self.tree[leaf as usize].count < self.tree[node as usize].count {
++                // [fasttext-python-bindings patch] `node >= i` means no internal node is ready
++                // yet: take a leaf. C++ relies on the 1e15 sentinel count of unbuilt nodes
++                // instead, which reads past the tree when a count is larger than it.
++                if leaf >= 0
++                    && (node as usize >= i
++                        || self.tree[leaf as usize].count < self.tree[node as usize].count)
++                {
+                     *mini_j = leaf;
+                     leaf -= 1;
+                 } else {
+@@ -525,8 +608,10 @@
+             }
+             self.tree[i].left = mini[0];
+             self.tree[i].right = mini[1];
+-            self.tree[i].count =
+-                self.tree[mini[0] as usize].count + self.tree[mini[1] as usize].count;
++            // [fasttext-python-bindings patch] saturating: counts come from the model file.
++            self.tree[i].count = self.tree[mini[0] as usize]
++                .count
++                .saturating_add(self.tree[mini[1] as usize].count);
+             self.tree[mini[0] as usize].parent = i as i32;
+             self.tree[mini[1] as usize].parent = i as i32;
+             self.tree[mini[1] as usize].binary = true;
+@@ -558,43 +643,46 @@
+         &self,
+         k: usize,
+         threshold: f32,
+-        node: usize,
++        root: usize,
+         score: f32,
+         heap: &mut Predictions,
+         hidden: &Vector,
+     ) {
+         let log_threshold = std_log(threshold);
+-        if score < log_threshold {
+-            return;
+-        }
+-        if heap.len() == k && !heap.is_empty() && score < heap.last().unwrap().0 {
+-            return;
+-        }
+-
+-        let n = &self.tree[node];
+-        if n.left == -1 && n.right == -1 {
 -            // Leaf node: insert into heap maintaining descending sort order
 -            let pos = heap
 -                .iter()
 -                .position(|&(s, _)| s < score)
 -                .unwrap_or(heap.len());
 -            heap.insert(pos, (score, node as i32));
-+            heap.push((score, node as i32));
-+            cpp_push_heap(heap);
-             if heap.len() > k {
+-            if heap.len() > k {
 -                heap.pop(); // Remove the minimum (last element)
-+                cpp_pop_heap(heap);
-+                heap.pop();
++        // [fasttext-python-bindings patch] An explicit stack instead of recursion: a model file
++        // can declare label counts that make the Huffman tree a chain as deep as the number of
++        // labels, which overflowed the thread stack. Popping the left child first visits the
++        // nodes in exactly the order of C++ `dfs`, so the results are unchanged.
++        let mut stack: Vec<(usize, f32)> = vec![(root, score)];
++        while let Some((node, score)) = stack.pop() {
++            if score < log_threshold {
++                continue;
++            }
++            // [fasttext-python-bindings patch] libstdc++ heap, exactly like C++ `dfs`.
++            if heap.len() == k && !heap.is_empty() && score < heap[0].0 {
++                continue;
              }
-             return;
-         }
+-            return;
+-        }
  
-         // Internal node: exact sigmoid of wo[node - osz] · hidden
-+        // (C++: `f = 1. / (1 + std::exp(-f))`, i.e. the division happens in double).
-         let matrix_row = node as i32 - self.osz;
-         let f_raw = self.base.wo.dot_row(hidden, matrix_row as i64);
+-        // Internal node: exact sigmoid of wo[node - osz] · hidden
+-        let matrix_row = node as i32 - self.osz;
+-        let f_raw = self.base.wo.dot_row(hidden, matrix_row as i64);
 -        let f = 1.0_f32 / (1.0 + (-f_raw).exp()); // exact sigmoid
-+        let f = (1.0_f64 / (1.0_f32 + (-f_raw).exp()) as f64) as f32;
++            let n = &self.tree[node];
++            if n.left == -1 && n.right == -1 {
++                heap.push((score, node as i32));
++                cpp_push_heap(heap);
++                if heap.len() > k {
++                    cpp_pop_heap(heap);
++                    heap.pop();
++                }
++                continue;
++            }
  
-         let left = self.tree[node].left as usize;
-         let right = self.tree[node].right as usize;
-@@ -659,8 +730,8 @@
+-        let left = self.tree[node].left as usize;
+-        let right = self.tree[node].right as usize;
++            // Internal node: exact sigmoid of wo[node - osz] · hidden
++            // (C++: `f = 1. / (1 + std::exp(-f))`, i.e. the division happens in double).
++            let matrix_row = node as i32 - self.osz;
++            let f_raw = self.base.wo.dot_row(hidden, matrix_row as i64);
++            let f = (1.0_f64 / (1.0_f32 + crate::utils::expf(-f_raw)) as f64) as f32;
+ 
+-        self.dfs_with_hidden(k, threshold, left, score + std_log(1.0 - f), heap, hidden);
+-        self.dfs_with_hidden(k, threshold, right, score + std_log(f), heap, hidden);
++            stack.push((n.right as usize, score + std_log(f)));
++            stack.push((n.left as usize, score + std_log(1.0 - f)));
++        }
+     }
+ 
+     /// Return the code length (tree depth) for leaf `i`.
+@@ -644,24 +732,58 @@
+                 .zip(code.iter())
+                 .fold(0.0f32, |acc, (&node, &c)| {
+                     let dot = self.base.wo.dot_row(&state.hidden, node as i64);
+-                    let f = 1.0_f32 / (1.0 + (-dot).exp()); // exact sigmoid
++                    let f = 1.0_f32 / (1.0 + crate::utils::expf(-dot)); // exact sigmoid
+                     if c {
+                         acc + std_log(f)
+                     } else {
+                         acc + std_log(1.0 - f)
+                     }
+                 });
+-            state.output[i] = log_prob.exp();
++            state.output[i] = crate::utils::expf(log_prob);
+         }
+     }
+ 
+     fn predict(&self, k: i32, threshold: f32, heap: &mut Predictions, state: &mut State) {
++        // [fasttext-python-bindings patch] No labels (possible in a corrupt model file): no tree.
++        if self.osz <= 0 {
++            return;
++        }
          let root = (2 * self.osz - 2) as usize;
          let hidden = &state.hidden;
          self.dfs_with_hidden(k as usize, threshold, root, 0.0, heap, hidden);
@@ -1146,12 +1623,43 @@ diff -ru a/src/loss.rs b/src/loss.rs
 -        heap.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 +        // [fasttext-python-bindings patch] C++ `std::sort_heap` (descending, same tie order).
 +        cpp_sort_heap(heap);
++    }
++}
++
++/// [fasttext-python-bindings patch] Depth of the deepest leaf of the Huffman tree that
++/// [`HierarchicalSoftmaxLoss`] builds for `counts` (0 for fewer than two leaves). Used to reject
++/// model files whose counts (zero, negative or unsorted) degenerate the tree into a chain,
++/// which makes the paths quadratic in the number of labels.
++pub(crate) fn huffman_max_depth(counts: &[i64]) -> usize {
++    if counts.len() < 2 || counts.len() > i32::MAX as usize / 2 {
++        return 0;
++    }
++    let mut hs = HierarchicalSoftmaxLoss {
++        base: BinaryLogisticBase::new(
++            Arc::new(DenseMatrix::new(0, 0)),
++            Arc::new(LossTables::new()),
++        ),
++        osz: counts.len() as i32,
++        paths: Vec::new(),
++        codes: Vec::new(),
++        tree: Vec::new(),
++    };
++    hs.build_huffman_nodes(counts);
++    // A parent always has a larger index than its children, so one backward pass suffices.
++    let mut depth = vec![0usize; hs.tree.len()];
++    for i in (0..hs.tree.len()).rev() {
++        let parent = hs.tree[i].parent;
++        if parent >= 0 {
++            depth[i] = depth[parent as usize] + 1;
++        }
      }
++    depth[..counts.len()].iter().copied().max().unwrap_or(0)
  }
  
+ // SoftmaxLoss
 diff -ru a/src/matrix.rs b/src/matrix.rs
 --- a/src/matrix.rs	2006-07-23 21:21:28.000000000 -0400
-+++ b/src/matrix.rs	2026-10-04 23:53:25.516060200 -0400
++++ b/src/matrix.rs	2026-10-05 15:54:16.298579800 -0400
 @@ -236,20 +236,37 @@
          let block_size = total / 10;
          let data = self.data_mut();
@@ -1198,9 +1706,199 @@ diff -ru a/src/matrix.rs b/src/matrix.rs
          }
      }
  
+@@ -410,6 +427,16 @@
+     }
+ 
+     fn load<R: Read>(reader: &mut R) -> Result<Self> {
++        Self::load_from(&mut utils::ModelReader::new(reader, None))
++    }
++}
++
++impl DenseMatrix {
++    /// [fasttext-python-bindings patch] [`Matrix::load`] with the declared `m x n` checked
++    /// against the bytes left in the file before allocating. When the length is unknown, the
++    /// data is read in chunks first, so a corrupt header cannot allocate more than what is
++    /// actually there.
++    pub fn load_from<R: Read>(reader: &mut utils::ModelReader<R>) -> Result<Self> {
+         let m = utils::read_i64(reader)?;
+         let n = utils::read_i64(reader)?;
+         if m < 0 || n < 0 {
+@@ -418,19 +445,20 @@
+                 m, n
+             )));
+         }
+-        // Validate that m*n doesn't overflow usize before allocating.
+-        let m_u = usize::try_from(m).map_err(|_| {
+-            FastTextError::InvalidModel(format!("Matrix row count {} is too large", m))
+-        })?;
+-        let n_u = usize::try_from(n).map_err(|_| {
+-            FastTextError::InvalidModel(format!("Matrix column count {} is too large", n))
+-        })?;
+-        m_u.checked_mul(n_u).ok_or_else(|| {
+-            FastTextError::InvalidModel(format!(
+-                "Matrix dimensions {}x{} would overflow usize",
+-                m, n
+-            ))
++        let size = (m as u64).checked_mul(n as u64).ok_or_else(|| {
++            FastTextError::InvalidModel(format!("Matrix dimensions {}x{} overflow", m, n))
+         })?;
++        reader.ensure(size, 4, &format!("{}x{} matrix", m, n))?;
++        let size = usize::try_from(size)
++            .ok()
++            .filter(|&s| s <= isize::MAX as usize / 4)
++            .ok_or_else(|| {
++                FastTextError::InvalidModel(format!("Matrix dimensions {}x{} are too large", m, n))
++            })?;
++        if reader.remaining().is_none() && size > (1 << 20) {
++            let data = utils::read_f32_vec(reader, size)?;
++            return Ok(DenseMatrix::from_data(m, n, &data));
++        }
+         let mut mat = DenseMatrix::new(m, n);
+         let data = mat.data_mut();
+         // Bulk-read the entire matrix as raw bytes, then reinterpret as f32.
+diff -ru a/src/meter.rs b/src/meter.rs
+--- a/src/meter.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/meter.rs	2026-10-05 15:54:16.324908300 -0400
+@@ -297,7 +297,9 @@
+         }
+ 
+         let mut score_vs_true = lm.score_vs_true.clone();
+-        score_vs_true.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
++        // [fasttext-python-bindings patch] `total_cmp`: NaN scores made the comparator
++        // inconsistent, which panics in `sort_by` since Rust 1.81.
++        score_vs_true.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+ 
+         let positive_counts = Self::compute_positive_counts(&score_vs_true);
+         if positive_counts.is_empty() {
+diff -ru a/src/product_quantizer.rs b/src/product_quantizer.rs
+--- a/src/product_quantizer.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/product_quantizer.rs	2026-10-05 15:54:16.364184500 -0400
+@@ -431,6 +431,13 @@
+     ///
+     /// Reads the same binary format as `save`.
+     pub fn load<R: Read>(reader: &mut R) -> Result<Self> {
++        Self::load_from(&mut utils::ModelReader::new(reader, None))
++    }
++
++    /// [fasttext-python-bindings patch] [`Self::load`] with the centroid table size checked
++    /// against the bytes left in the file before allocating (`dim * KSUB` used to overflow
++    /// `i32`).
++    pub fn load_from<R: Read>(reader: &mut utils::ModelReader<R>) -> Result<Self> {
+         let dim = utils::read_i32(reader)?;
+         let nsubq = utils::read_i32(reader)?;
+         let dsub = utils::read_i32(reader)?;
+@@ -442,11 +449,9 @@
+             ));
+         }
+ 
+-        let centroids_len = (dim * KSUB) as usize;
+-        let mut centroids = vec![0.0f32; centroids_len];
+-        for v in centroids.iter_mut() {
+-            *v = utils::read_f32(reader)?;
+-        }
++        let centroids_len = dim as u64 * KSUB as u64;
++        reader.ensure(centroids_len, 4, "product quantizer centroids")?;
++        let centroids = utils::read_f32_vec(reader, centroids_len as usize)?;
+ 
+         Ok(ProductQuantizer {
+             dim,
+@@ -457,6 +462,27 @@
+             rng: MinstdRng::new(SEED),
+         })
+     }
++
++    /// [fasttext-python-bindings patch] Check the layout that `get_centroids` / `addcode` /
++    /// `mulcode` rely on: `nsubq - 1` sub-quantizers of `dsub` dimensions plus a last one of
++    /// `lastdsub` (`1 <= lastdsub <= dsub`) cover exactly `dim`. A model file that breaks it
++    /// would make decoding index out of bounds.
++    pub fn validate(&self, what: &str) -> Result<()> {
++        let covered = (self.nsubq as i64 - 1) * self.dsub as i64 + self.lastdsub as i64;
++        if self.nsubq < 1
++            || self.dsub < 1
++            || self.lastdsub < 1
++            || self.lastdsub > self.dsub
++            || covered != self.dim as i64
++            || self.centroids.len() != self.dim as usize * KSUB as usize
++        {
++            return Err(FastTextError::InvalidModel(format!(
++                "{}: inconsistent product quantizer (dim={}, nsubq={}, dsub={}, lastdsub={})",
++                what, self.dim, self.nsubq, self.dsub, self.lastdsub
++            )));
++        }
++        Ok(())
++    }
+ }
+ 
+ // Tests
+diff -ru a/src/quant_matrix.rs b/src/quant_matrix.rs
+--- a/src/quant_matrix.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/quant_matrix.rs	2026-10-05 16:26:08.124611500 -0400
+@@ -231,6 +231,16 @@
+     ///
+     /// Reads the same layout as `save`.
+     fn load<R: Read>(reader: &mut R) -> Result<Self> {
++        Self::load_from(&mut utils::ModelReader::new(reader, None))
++    }
++}
++
++impl QuantMatrix {
++    /// [fasttext-python-bindings patch] [`Matrix::load`] with every declared size checked
++    /// against the bytes left in the file before allocating, and the product quantizers
++    /// validated (see [`ProductQuantizer::validate`]) so that decoding a row can never index
++    /// out of bounds.
++    pub fn load_from<R: Read>(reader: &mut utils::ModelReader<R>) -> Result<Self> {
+         let qnorm = utils::read_bool(reader)?;
+         let m = utils::read_i64(reader)?;
+         let n = utils::read_i64(reader)?;
+@@ -249,10 +259,17 @@
+             )));
+         }
+ 
+-        let mut codes = vec![0u8; codesize as usize];
+-        reader.read_exact(&mut codes)?;
++        reader.ensure(codesize as u64, 1, "quantized matrix codes")?;
++        let codes = utils::read_bytes_vec(reader, codesize as usize)?;
+ 
+-        let pq = ProductQuantizer::load(reader)?;
++        let pq = ProductQuantizer::load_from(reader)?;
++        pq.validate("quantized matrix")?;
++        if pq.dim as i64 != n {
++            return Err(FastTextError::InvalidModel(format!(
++                "QuantMatrix has {} columns but its product quantizer has dimension {}",
++                n, pq.dim
++            )));
++        }
+ 
+         // Validate structural invariant: codesize must equal m * pq.nsubq.
+         let expected_codesize = m.checked_mul(pq.nsubq as i64).ok_or_else(|| {
+@@ -269,20 +286,10 @@
+         }
+ 
+         let (norm_codes, npq) = if qnorm {
+-            let mut nc = vec![0u8; m as usize];
+-            reader.read_exact(&mut nc)?;
+-
+-            // Validate norm_codes length matches m.
+-            if nc.len() != m as usize {
+-                return Err(FastTextError::InvalidModel(format!(
+-                    "QuantMatrix norm_codes length mismatch: got {} but expected {} (m={})",
+-                    nc.len(),
+-                    m,
+-                    m
+-                )));
+-            }
+-
+-            let npq = ProductQuantizer::load(reader)?;
++            reader.ensure(m as u64, 1, "quantized matrix norm codes")?;
++            let nc = utils::read_bytes_vec(reader, m as usize)?;
++            let npq = ProductQuantizer::load_from(reader)?;
++            npq.validate("norm quantizer")?;
+             (Some(nc), Some(npq))
+         } else {
+             (None, None)
 diff -ru a/src/simd/mod.rs b/src/simd/mod.rs
 --- a/src/simd/mod.rs	2006-07-23 21:21:28.000000000 -0400
-+++ b/src/simd/mod.rs	2026-10-04 21:28:06.971448100 -0400
++++ b/src/simd/mod.rs	2026-10-05 15:54:31.404248700 -0400
 @@ -1,3 +1,4 @@
 +#![cfg_attr(not(feature = "simd-dot"), allow(dead_code))] // [fasttext-python-bindings patch]
  // Shared SIMD kernels for dot product, vector addition, and row averaging.
@@ -1233,8 +1931,167 @@ diff -ru a/src/simd/mod.rs b/src/simd/mod.rs
          neon::dot(a, b)
 diff -ru a/src/utils.rs b/src/utils.rs
 --- a/src/utils.rs	2006-07-23 21:21:28.000000000 -0400
-+++ b/src/utils.rs	2026-10-04 21:26:13.034504500 -0400
-@@ -100,9 +100,9 @@
++++ b/src/utils.rs	2026-10-05 15:54:16.426422200 -0400
+@@ -1,6 +1,6 @@
+ use std::io::{Read, Write};
+ 
+-use crate::error::Result;
++use crate::error::{FastTextError, Result};
+ 
+ /// FNV-1a hash function matching C++ fastText `Dictionary::hash` exactly.
+ ///
+@@ -36,6 +36,8 @@
+ }
+ 
+ /// Read a little-endian `f32` from a reader.
++// [fasttext-python-bindings patch] Unused since the loaders read `f32` arrays in bulk.
++#[allow(dead_code)]
+ pub fn read_f32<R: Read>(reader: &mut R) -> Result<f32> {
+     let mut buf = [0u8; 4];
+     reader.read_exact(&mut buf)?;
+@@ -73,6 +75,136 @@
+     Ok(())
+ }
+ 
++/// [fasttext-python-bindings patch] A reader over a model file that counts the bytes consumed
++/// and, when the total length is known (files, byte slices), lets the loaders check a size
++/// declared in the file against the bytes that actually remain *before* allocating for it. A
++/// corrupt or malicious header (e.g. `nwords = 2^31`, a 10^12-element matrix) then fails with
++/// `InvalidModel` instead of a huge allocation.
++pub struct ModelReader<R> {
++    inner: R,
++    pos: u64,
++    len: Option<u64>,
++}
++
++impl<R: Read> ModelReader<R> {
++    /// Wrap `inner`; `len` is the total number of bytes it holds, if known.
++    pub fn new(inner: R, len: Option<u64>) -> Self {
++        ModelReader { inner, pos: 0, len }
++    }
++
++    /// Bytes consumed so far.
++    pub fn position(&self) -> u64 {
++        self.pos
++    }
++
++    /// Total length if known, else the bytes consumed so far.
++    pub fn len_or_position(&self) -> u64 {
++        self.len.unwrap_or(self.pos)
++    }
++
++    /// Bytes left, if the total length is known.
++    pub fn remaining(&self) -> Option<u64> {
++        self.len.map(|l| l.saturating_sub(self.pos))
++    }
++
++    /// Fail unless `count` items of `item_size` bytes can still be in the file.
++    pub fn ensure(&self, count: u64, item_size: u64, what: &str) -> Result<()> {
++        let bytes = count.checked_mul(item_size).ok_or_else(|| {
++            FastTextError::InvalidModel(format!("{what}: declared size {count} is too large"))
++        })?;
++        match self.remaining() {
++            Some(rem) if bytes > rem => Err(FastTextError::InvalidModel(format!(
++                "{what}: the file declares {count} entries ({bytes} bytes) but only {rem} \
++                 bytes remain (truncated or corrupt model file)"
++            ))),
++            _ => Ok(()),
++        }
++    }
++}
++
++impl<R: Read> Read for ModelReader<R> {
++    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++        let n = self.inner.read(buf)?;
++        self.pos += n as u64;
++        Ok(n)
++    }
++}
++
++/// [fasttext-python-bindings patch] Read exactly `count` bytes, growing the buffer in chunks so
++/// that a corrupt `count` cannot allocate more than the data that is actually there.
++pub fn read_bytes_vec<R: Read>(reader: &mut R, count: usize) -> Result<Vec<u8>> {
++    const CHUNK: usize = 1 << 20;
++    let mut out = Vec::with_capacity(count.min(CHUNK));
++    while out.len() < count {
++        let start = out.len();
++        let n = (count - start).min(CHUNK);
++        out.resize(start + n, 0);
++        reader.read_exact(&mut out[start..])?;
++    }
++    Ok(out)
++}
++
++/// [fasttext-python-bindings patch] Read `count` little-endian `f32`s (chunked, see
++/// [`read_bytes_vec`]).
++pub fn read_f32_vec<R: Read>(reader: &mut R, count: usize) -> Result<Vec<f32>> {
++    const CHUNK: usize = 1 << 18;
++    let mut out: Vec<f32> = Vec::with_capacity(count.min(CHUNK));
++    let mut buf = vec![0u8; count.min(CHUNK) * 4];
++    while out.len() < count {
++        let n = (count - out.len()).min(CHUNK);
++        reader.read_exact(&mut buf[..n * 4])?;
++        out.extend(
++            buf[..n * 4]
++                .chunks_exact(4)
++                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
++        );
++    }
++    Ok(out)
++}
++
++/// [fasttext-python-bindings patch] `expf` and `log` for the hot loops (softmax, probabilities,
++/// `std_log`). On `windows-gnu` (mingw-w64) the toolchain's libm `expf` is an x87 routine about
++/// 15x slower than glibc's or the UCRT's (and `log` about 5x), which made softmax training 2.5x
++/// slower than on Linux. There, call the UCRT implementations from `ucrtbase.dll` (present
++/// wherever CPython 3.5+ runs, and what MSVC builds use). Elsewhere this is `f32::exp` /
++/// `f64::ln` unchanged.
++#[cfg(all(windows, target_env = "gnu"))]
++mod ucrt {
++    #[link(name = "ucrtbase", kind = "raw-dylib")]
++    unsafe extern "C" {
++        pub fn expf(x: f32) -> f32;
++        pub fn log(x: f64) -> f64;
++    }
++}
++
++/// `x.exp()` (see the note on the `ucrt` module for windows-gnu).
++#[inline]
++pub fn expf(x: f32) -> f32 {
++    #[cfg(all(windows, target_env = "gnu"))]
++    {
++        // SAFETY: a pure C math function with no preconditions.
++        unsafe { ucrt::expf(x) }
++    }
++    #[cfg(not(all(windows, target_env = "gnu")))]
++    {
++        x.exp()
++    }
++}
++
++/// `x.ln()` for `f64` (see [`expf`]).
++#[inline]
++pub fn ln(x: f64) -> f64 {
++    #[cfg(all(windows, target_env = "gnu"))]
++    {
++        // SAFETY: a pure C math function with no preconditions.
++        unsafe { ucrt::log(x) }
++    }
++    #[cfg(not(all(windows, target_env = "gnu")))]
++    {
++        x.ln()
++    }
++}
++
+ /// Read a boolean (1 byte) from a reader.
+ pub fn read_bool<R: Read>(reader: &mut R) -> Result<bool> {
+     let mut buf = [0u8; 1];
+@@ -96,13 +228,13 @@
+     let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+     let mut z = 0.0f32;
+     for v in data.iter_mut() {
+-        *v = (*v - max).exp();
++        *v = expf(*v - max);
          z += *v;
      }
      if z > 0.0 {
