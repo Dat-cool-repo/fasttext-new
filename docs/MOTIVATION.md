@@ -64,7 +64,7 @@ tested against it.
 
 - Supervised training (`train_supervised`). *Done, together with `train_unsupervised`,
   `test`, `save_model` and `quantize`.*
-- Free-threaded Python (3.13t+) wheels. *Done (built and tested for 3.14t on Linux).*
+- Free-threaded Python wheels. *Done for 3.14t (built and tested in CI on Linux, macOS and Windows); PyO3 0.29 does not support 3.13t.*
 - A `fasttext-score` CLI that scores a text column in Parquet / JSONL files in parallel. *Not
   started.*
 - A datatrove filter adapter and a NeMo Curator example. *Not started.*

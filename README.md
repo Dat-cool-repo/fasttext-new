@@ -5,7 +5,7 @@ that gives the same predictions as the original, bit for bit.**
 
 [![wheels](https://github.com/Dat-cool-repo/fasttext-new/actions/workflows/wheels.yml/badge.svg)](https://github.com/Dat-cool-repo/fasttext-new/actions/workflows/wheels.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-![Python 3.9+](https://img.shields.io/badge/python-3.9%2B%20%7C%203.13t%20%7C%203.14t-blue.svg)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B%20%7C%203.14t-blue.svg)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
 `fasttext-new` is a Python package (PyPI name `fasttext-new`, import name `fasttext_new`) that
@@ -47,7 +47,7 @@ The original research and planning note is in [docs/MOTIVATION.md](docs/MOTIVATI
 - **Fast.** Faster than the C++ package on a single thread, plus `predict_batch` that scores a
   list of texts on all cores with the GIL released.
 - **Training with the GIL released**, C++-style `verbose` progress output, and Ctrl-C support.
-- **Free-threaded Python** (3.13t / 3.14t): the module does not re-enable the GIL, and
+- **Free-threaded Python** (3.14t): the module does not re-enable the GIL, and
   `predict` scales across Python threads.
 - **No C++ toolchain** needed, NumPy 1 and 2 both supported, one abi3 wheel per platform for
   CPython 3.9+.
@@ -250,12 +250,13 @@ Run it yourself with `bash scripts/bench.sh` (add `--doc-chars 2000` for long do
 | Linux x86_64, abi3 (CPython 3.9+) | CI and local | Full test suite |
 | Linux x86_64, free-threaded 3.14t | CI and local | Golden tests and a thread-scaling check |
 | Windows x86_64, abi3 | CI (MSVC); also cross-compiled with mingw-w64 (`scripts/build_windows_wheel.sh`) | Golden tests and a smoke test on Windows with the mingw build |
-| Linux aarch64, macOS x86_64 / arm64, Windows 3.13t / 3.14t | CI only | Not yet tested |
+| Linux aarch64, macOS x86_64 / arm64 (abi3 and 3.14t), Windows 3.14t | CI only | Golden tests and a smoke test in CI |
 
 The CI workflow ([`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)) builds abi3 and
-free-threaded (3.13t / 3.14t) wheels for all of these plus an sdist, runs `cargo fmt` / `test` /
-`clippy`, and tests every wheel on its platform with Python 3.10, 3.12 and 3.14t. It does not
-publish anything.
+free-threaded 3.14t wheels for all of these plus an sdist, runs `cargo fmt` / `test` /
+`clippy`, and tests every wheel on its platform with Python 3.10, 3.12 and 3.14t. There is no
+3.13t wheel: PyO3 0.29 supports free-threaded CPython only from 3.14. It does not publish
+anything.
 
 ## Development
 
