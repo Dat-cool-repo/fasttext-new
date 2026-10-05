@@ -46,6 +46,32 @@ jobs:
         env:
           PYO3_PYTHON: python
 
+  fuzz:
+    name: fuzz smoke test (60 s per target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: build
+        working-directory: fuzz
+        run: cargo +nightly fuzz build
+      - name: run
+        working-directory: fuzz
+        run: |
+          mkdir -p corpus/load_model corpus/predict corpus/train
+          cp ../tests/data/models/tiny_* regressions/load_model/* corpus/load_model/ 2>/dev/null || true
+          cp regressions/predict/* corpus/predict/ 2>/dev/null || true
+          cp regressions/train/* corpus/train/ 2>/dev/null || true
+          printf '\x00\x00apple banana cherry' > corpus/predict/seed
+          printf '\x00\x00\x00__label__a apple banana\n__label__b cherry\n' > corpus/train/seed
+          for t in load_model:65536 predict:8192 train:4096; do
+            cargo +nightly fuzz run ${t%%:*} corpus/${t%%:*} -- -max_total_time=60 \
+              -rss_limit_mb=2048 -timeout=10 -max_len=${t##*:}
+          done
+
   linux:
     name: linux ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
@@ -180,9 +206,13 @@ jobs:
         shell: bash
         env:
           FASTTEXT_NEW_DATA: data
-        # test_golden: parity with recorded C++ outputs (checked in); test_parity /
-        # test_training run fully only where fasttext-numpy2 is installed (otherwise skipped).
-        run: python -m pytest -q -p no:cacheprovider tests/test_golden.py tests/test_parity.py -rs
+        # test_golden: parity with recorded C++ outputs (checked in: lid.176.ftz and the tiny
+        # models of tests/data/models); test_selfcheck / test_malformed: self-consistency, API,
+        # threading and corrupt-model tests (no C++ needed); test_parity runs fully only where
+        # fasttext-numpy2 is installed (otherwise skipped).
+        run: >-
+          python -m pytest -q -p no:cacheprovider -rs
+          tests/test_golden.py tests/test_selfcheck.py tests/test_malformed.py tests/test_parity.py
       - name: smoke test (train / test / quantize / save / reload, GIL released)
         shell: bash
         run: |
