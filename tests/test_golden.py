@@ -74,7 +74,7 @@ def test_golden_vectors_and_vocab(name):
     assert words[:: max(1, len(words) // 50)][:50] == g["words_sample"]
     for w, v in g["word_vectors"].items():
         np.testing.assert_allclose(m.get_word_vector(w), v, rtol=0, atol=TOL, err_msg=w)
-    texts = [t for t, _, _ in g.get("predict", [])][:30]
+    texts = g.get("sentence_texts") or [t for t, _, _ in g.get("predict", [])][:30]
     for t, v in zip(texts, g["sentence_vectors"]):
         np.testing.assert_allclose(m.get_sentence_vector(t), v, rtol=0, atol=TOL)
 
@@ -98,3 +98,58 @@ def test_training_quality_vs_recorded_cpp():
     p1 = m.test(str(DATA / "cooking.valid"))[1]
     print(f"TRAIN cooking: P@1 {p1:.4f} vs recorded C++ {g['p1_mean']:.4f}")
     assert abs(p1 - g["p1_mean"]) <= 0.02
+
+
+def _need(g: dict, key: str) -> None:
+    if key not in g:
+        pytest.skip(f"no {key} reference in this golden file")
+
+
+@pytest.mark.parametrize("name", sorted(GOLDEN))
+def test_golden_predict_all_labels(name):
+    """k=-1 with a threshold: every label above it, in the same order."""
+    g, m, _ = load(name)
+    _need(g, "predict_all")
+    for t, labels, probs in g["predict_all"]:
+        ml, mp = m.predict(t, k=-1, threshold=0.05)
+        assert list(ml) == labels, repr(t[:60])
+        np.testing.assert_allclose(mp, probs, rtol=0, atol=TOL)
+
+
+@pytest.mark.parametrize("name", sorted(GOLDEN))
+def test_golden_test_label(name):
+    g, m, d = load(name)
+    _need(g, "test_label")
+    got = m.test_label(str(d / g["test"]["file"]), k=1)
+    assert sorted(got) == sorted(g["test_label"])
+    for label, (p, r, f1) in g["test_label"].items():
+        want = [p, r, f1]
+        have = [got[label]["precision"], got[label]["recall"], got[label]["f1score"]]
+        np.testing.assert_allclose(have, want, rtol=0, atol=1e-12, err_msg=label)
+
+
+@pytest.mark.parametrize("name", sorted(GOLDEN))
+def test_golden_subwords_and_ids(name):
+    g, m, _ = load(name)
+    _need(g, "subwords")
+    for w, (strings, ids) in g["subwords"].items():
+        s, i = m.get_subwords(w)
+        assert list(s) == strings, w
+        assert [int(x) for x in i] == ids, w
+    for w, i in g["word_ids"].items():
+        assert m.get_word_id(w) == i, w
+    for w, i in g.get("subword_ids", {}).items():
+        assert m.get_subword_id(w) == i, w
+
+
+@pytest.mark.parametrize("name", sorted(GOLDEN))
+def test_golden_nearest_neighbors(name):
+    g, m, _ = load(name)
+    _need(g, "nn")
+    for w, want in g["nn"].items():
+        got = m.get_nearest_neighbors(w, k=5)
+        assert [x for _, x in got] == [x for _, x in want], w
+        np.testing.assert_allclose([s for s, _ in got], [s for s, _ in want], rtol=0, atol=TOL)
+    got = m.get_analogies("apple", "banana", "guitar", k=5)
+    assert [x for _, x in got] == [x for _, x in g["analogies"]]
+    np.testing.assert_allclose([s for s, _ in got], [s for s, _ in g["analogies"]], rtol=0, atol=TOL)
