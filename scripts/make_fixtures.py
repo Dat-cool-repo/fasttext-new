@@ -8,8 +8,12 @@ Usage (inside the project venv, which has `fasttext-numpy2` installed):
 Writes `fx_*.bin` / `fx_*.ftz` and `train.txt` to DATA_DIR (default $FASTTEXT_NEW_DATA or
 ./data in the repository).
 
-The C++ trainer sporadically aborts with "Encountered NaN" on these tiny runs, so every model
-is trained in a fresh subprocess and retried.
+Why ``thread=10``: the C++ package allocates the input matrix uninitialized and
+``DenseMatrix::uniform`` fills only ``thread`` tenths of it, so with fewer threads part of the
+matrix is whatever was in memory (heap garbage for small matrices), and the C++ trainer
+sporadically aborted with "Encountered NaN" (e.g. on ``fx_softmax_nosub``). With 10 threads at
+most the last ``rows * dim % 10`` values are left out. Every model is still trained in a fresh
+subprocess and retried, to be safe.
 """
 
 import csv
@@ -95,7 +99,7 @@ def main(data: Path) -> None:
     raw = data / "raw.txt"
     raw.write_text("\n".join(t for _, t in lines) + "\n", encoding="utf-8")
 
-    common = dict(input=str(train), dim=16, epoch=5, minn=2, maxn=4, bucket=100_000, thread=4, verbose=0)
+    common = dict(input=str(train), dim=16, epoch=5, minn=2, maxn=4, bucket=100_000, thread=10, verbose=0)
     for name, kw in SUPERVISED.items():
         kw = dict(kw)
         src = many if kw.pop("many", False) else train
@@ -104,7 +108,7 @@ def main(data: Path) -> None:
             run(dict(kind="sup", out=str(out), args={**common, **kw, "input": str(src)}))
     for name, (base, kw) in QUANTIZED.items():
         run(dict(kind="quant", base=str(data / f"{base}.bin"), out=str(data / f"{name}.ftz"), args=dict(input=str(train), **kw)))
-    cbow = dict(input=str(raw), model="cbow", dim=16, epoch=2, minn=2, maxn=4, bucket=100_000, thread=4, verbose=0)
+    cbow = dict(input=str(raw), model="cbow", dim=16, epoch=2, minn=2, maxn=4, bucket=100_000, thread=10, verbose=0)
     run(dict(kind="cbow", out=str(data / "fx_cbow.bin"), args=cbow))
 
 
