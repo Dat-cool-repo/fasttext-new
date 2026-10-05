@@ -189,6 +189,9 @@ impl FastText {
         k: usize,
         ban_words: &[&str],
     ) -> Vec<(f32, String)> {
+        // [fasttext-python-bindings patch] `k` comes from the caller (e.g. Python); never
+        // reserve more than the vocabulary (`k + 1` also overflowed for `usize::MAX`).
+        let k = k.min(self.dict.nwords().max(0) as usize);
         if k == 0 {
             return Vec::new();
         }
@@ -227,7 +230,15 @@ impl FastText {
             .into_iter()
             .map(|Reverse((OrdF32(sim), i))| (sim, self.dict.get_word(i as i32).to_string()))
             .collect();
-        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // [fasttext-python-bindings patch] NaN similarities (a model file with NaN weights)
+        // made the comparator inconsistent, which panics in `sort_by` since Rust 1.81. Rank
+        // NaN last; every other comparison is unchanged.
+        let key = |x: f32| if x.is_nan() { f32::NEG_INFINITY } else { x };
+        results.sort_by(|a, b| {
+            key(b.0)
+                .partial_cmp(&key(a.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results
     }
 }

@@ -30,6 +30,14 @@ env/
 *.csv
 tests/data/*.txt
 !tests/data/sentences.txt
+# ...except the tiny fixture models committed for the golden tests (scripts/make_tiny_models.py)
+!tests/data/models/*.bin
+!tests/data/models/*.ftz
+
+# Fuzzing (corpora and crash artifacts stay local; minimized regressions are committed)
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
 
 # Benchmarks and editor files
 bench/results*.json

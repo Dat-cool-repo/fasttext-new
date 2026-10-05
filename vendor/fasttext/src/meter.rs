@@ -297,7 +297,9 @@ impl Meter {
         }
 
         let mut score_vs_true = lm.score_vs_true.clone();
-        score_vs_true.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // [fasttext-python-bindings patch] `total_cmp`: NaN scores made the comparator
+        // inconsistent, which panics in `sort_by` since Rust 1.81.
+        score_vs_true.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
 
         let positive_counts = Self::compute_positive_counts(&score_vs_true);
         if positive_counts.is_empty() {

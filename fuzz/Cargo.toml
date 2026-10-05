@@ -1,0 +1,46 @@
+# Fuzz targets for fasttext-new (cargo-fuzz / libFuzzer). See fuzz/README.md.
+[package]
+name = "fasttext-new-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fasttext-new = { path = ".." }
+fasttext = "0.8"
+
+# Same vendored, patched crate as the main package.
+[patch.crates-io]
+fasttext = { path = "../vendor/fasttext" }
+
+# Keep the fuzz crate out of the main package's workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "load_model"
+path = "fuzz_targets/load_model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "predict"
+path = "fuzz_targets/predict.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "train"
+path = "fuzz_targets/train.rs"
+test = false
+doc = false
+bench = false

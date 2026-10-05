@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use crate::error::Result;
+use crate::error::{FastTextError, Result};
 
 /// FNV-1a hash function matching C++ fastText `Dictionary::hash` exactly.
 ///
@@ -36,6 +36,8 @@ pub fn read_i64<R: Read>(reader: &mut R) -> Result<i64> {
 }
 
 /// Read a little-endian `f32` from a reader.
+// [fasttext-python-bindings patch] Unused since the loaders read `f32` arrays in bulk.
+#[allow(dead_code)]
 pub fn read_f32<R: Read>(reader: &mut R) -> Result<f32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
@@ -73,6 +75,136 @@ pub fn write_f64<W: Write>(writer: &mut W, value: f64) -> Result<()> {
     Ok(())
 }
 
+/// [fasttext-python-bindings patch] A reader over a model file that counts the bytes consumed
+/// and, when the total length is known (files, byte slices), lets the loaders check a size
+/// declared in the file against the bytes that actually remain *before* allocating for it. A
+/// corrupt or malicious header (e.g. `nwords = 2^31`, a 10^12-element matrix) then fails with
+/// `InvalidModel` instead of a huge allocation.
+pub struct ModelReader<R> {
+    inner: R,
+    pos: u64,
+    len: Option<u64>,
+}
+
+impl<R: Read> ModelReader<R> {
+    /// Wrap `inner`; `len` is the total number of bytes it holds, if known.
+    pub fn new(inner: R, len: Option<u64>) -> Self {
+        ModelReader { inner, pos: 0, len }
+    }
+
+    /// Bytes consumed so far.
+    pub fn position(&self) -> u64 {
+        self.pos
+    }
+
+    /// Total length if known, else the bytes consumed so far.
+    pub fn len_or_position(&self) -> u64 {
+        self.len.unwrap_or(self.pos)
+    }
+
+    /// Bytes left, if the total length is known.
+    pub fn remaining(&self) -> Option<u64> {
+        self.len.map(|l| l.saturating_sub(self.pos))
+    }
+
+    /// Fail unless `count` items of `item_size` bytes can still be in the file.
+    pub fn ensure(&self, count: u64, item_size: u64, what: &str) -> Result<()> {
+        let bytes = count.checked_mul(item_size).ok_or_else(|| {
+            FastTextError::InvalidModel(format!("{what}: declared size {count} is too large"))
+        })?;
+        match self.remaining() {
+            Some(rem) if bytes > rem => Err(FastTextError::InvalidModel(format!(
+                "{what}: the file declares {count} entries ({bytes} bytes) but only {rem} \
+                 bytes remain (truncated or corrupt model file)"
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl<R: Read> Read for ModelReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+/// [fasttext-python-bindings patch] Read exactly `count` bytes, growing the buffer in chunks so
+/// that a corrupt `count` cannot allocate more than the data that is actually there.
+pub fn read_bytes_vec<R: Read>(reader: &mut R, count: usize) -> Result<Vec<u8>> {
+    const CHUNK: usize = 1 << 20;
+    let mut out = Vec::with_capacity(count.min(CHUNK));
+    while out.len() < count {
+        let start = out.len();
+        let n = (count - start).min(CHUNK);
+        out.resize(start + n, 0);
+        reader.read_exact(&mut out[start..])?;
+    }
+    Ok(out)
+}
+
+/// [fasttext-python-bindings patch] Read `count` little-endian `f32`s (chunked, see
+/// [`read_bytes_vec`]).
+pub fn read_f32_vec<R: Read>(reader: &mut R, count: usize) -> Result<Vec<f32>> {
+    const CHUNK: usize = 1 << 18;
+    let mut out: Vec<f32> = Vec::with_capacity(count.min(CHUNK));
+    let mut buf = vec![0u8; count.min(CHUNK) * 4];
+    while out.len() < count {
+        let n = (count - out.len()).min(CHUNK);
+        reader.read_exact(&mut buf[..n * 4])?;
+        out.extend(
+            buf[..n * 4]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        );
+    }
+    Ok(out)
+}
+
+/// [fasttext-python-bindings patch] `expf` and `log` for the hot loops (softmax, probabilities,
+/// `std_log`). On `windows-gnu` (mingw-w64) the toolchain's libm `expf` is an x87 routine about
+/// 15x slower than glibc's or the UCRT's (and `log` about 5x), which made softmax training 2.5x
+/// slower than on Linux. There, call the UCRT implementations from `ucrtbase.dll` (present
+/// wherever CPython 3.5+ runs, and what MSVC builds use). Elsewhere this is `f32::exp` /
+/// `f64::ln` unchanged.
+#[cfg(all(windows, target_env = "gnu"))]
+mod ucrt {
+    #[link(name = "ucrtbase", kind = "raw-dylib")]
+    unsafe extern "C" {
+        pub fn expf(x: f32) -> f32;
+        pub fn log(x: f64) -> f64;
+    }
+}
+
+/// `x.exp()` (see the note on the `ucrt` module for windows-gnu).
+#[inline]
+pub fn expf(x: f32) -> f32 {
+    #[cfg(all(windows, target_env = "gnu"))]
+    {
+        // SAFETY: a pure C math function with no preconditions.
+        unsafe { ucrt::expf(x) }
+    }
+    #[cfg(not(all(windows, target_env = "gnu")))]
+    {
+        x.exp()
+    }
+}
+
+/// `x.ln()` for `f64` (see [`expf`]).
+#[inline]
+pub fn ln(x: f64) -> f64 {
+    #[cfg(all(windows, target_env = "gnu"))]
+    {
+        // SAFETY: a pure C math function with no preconditions.
+        unsafe { ucrt::log(x) }
+    }
+    #[cfg(not(all(windows, target_env = "gnu")))]
+    {
+        x.ln()
+    }
+}
+
 /// Read a boolean (1 byte) from a reader.
 pub fn read_bool<R: Read>(reader: &mut R) -> Result<bool> {
     let mut buf = [0u8; 1];
@@ -96,7 +228,7 @@ pub fn softmax_in_place(data: &mut [f32]) {
     let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut z = 0.0f32;
     for v in data.iter_mut() {
-        *v = (*v - max).exp();
+        *v = expf(*v - max);
         z += *v;
     }
     if z > 0.0 {

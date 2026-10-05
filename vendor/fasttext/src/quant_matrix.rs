@@ -231,6 +231,16 @@ impl Matrix for QuantMatrix {
     ///
     /// Reads the same layout as `save`.
     fn load<R: Read>(reader: &mut R) -> Result<Self> {
+        Self::load_from(&mut utils::ModelReader::new(reader, None))
+    }
+}
+
+impl QuantMatrix {
+    /// [fasttext-python-bindings patch] [`Matrix::load`] with every declared size checked
+    /// against the bytes left in the file before allocating, and the product quantizers
+    /// validated (see [`ProductQuantizer::validate`]) so that decoding a row can never index
+    /// out of bounds.
+    pub fn load_from<R: Read>(reader: &mut utils::ModelReader<R>) -> Result<Self> {
         let qnorm = utils::read_bool(reader)?;
         let m = utils::read_i64(reader)?;
         let n = utils::read_i64(reader)?;
@@ -249,10 +259,17 @@ impl Matrix for QuantMatrix {
             )));
         }
 
-        let mut codes = vec![0u8; codesize as usize];
-        reader.read_exact(&mut codes)?;
+        reader.ensure(codesize as u64, 1, "quantized matrix codes")?;
+        let codes = utils::read_bytes_vec(reader, codesize as usize)?;
 
-        let pq = ProductQuantizer::load(reader)?;
+        let pq = ProductQuantizer::load_from(reader)?;
+        pq.validate("quantized matrix")?;
+        if pq.dim as i64 != n {
+            return Err(FastTextError::InvalidModel(format!(
+                "QuantMatrix has {} columns but its product quantizer has dimension {}",
+                n, pq.dim
+            )));
+        }
 
         // Validate structural invariant: codesize must equal m * pq.nsubq.
         let expected_codesize = m.checked_mul(pq.nsubq as i64).ok_or_else(|| {
@@ -269,20 +286,10 @@ impl Matrix for QuantMatrix {
         }
 
         let (norm_codes, npq) = if qnorm {
-            let mut nc = vec![0u8; m as usize];
-            reader.read_exact(&mut nc)?;
-
-            // Validate norm_codes length matches m.
-            if nc.len() != m as usize {
-                return Err(FastTextError::InvalidModel(format!(
-                    "QuantMatrix norm_codes length mismatch: got {} but expected {} (m={})",
-                    nc.len(),
-                    m,
-                    m
-                )));
-            }
-
-            let npq = ProductQuantizer::load(reader)?;
+            reader.ensure(m as u64, 1, "quantized matrix norm codes")?;
+            let nc = utils::read_bytes_vec(reader, m as usize)?;
+            let npq = ProductQuantizer::load_from(reader)?;
+            npq.validate("norm quantizer")?;
             (Some(nc), Some(npq))
         } else {
             (None, None)

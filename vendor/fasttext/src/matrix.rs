@@ -427,6 +427,16 @@ impl Matrix for DenseMatrix {
     }
 
     fn load<R: Read>(reader: &mut R) -> Result<Self> {
+        Self::load_from(&mut utils::ModelReader::new(reader, None))
+    }
+}
+
+impl DenseMatrix {
+    /// [fasttext-python-bindings patch] [`Matrix::load`] with the declared `m x n` checked
+    /// against the bytes left in the file before allocating. When the length is unknown, the
+    /// data is read in chunks first, so a corrupt header cannot allocate more than what is
+    /// actually there.
+    pub fn load_from<R: Read>(reader: &mut utils::ModelReader<R>) -> Result<Self> {
         let m = utils::read_i64(reader)?;
         let n = utils::read_i64(reader)?;
         if m < 0 || n < 0 {
@@ -435,19 +445,20 @@ impl Matrix for DenseMatrix {
                 m, n
             )));
         }
-        // Validate that m*n doesn't overflow usize before allocating.
-        let m_u = usize::try_from(m).map_err(|_| {
-            FastTextError::InvalidModel(format!("Matrix row count {} is too large", m))
+        let size = (m as u64).checked_mul(n as u64).ok_or_else(|| {
+            FastTextError::InvalidModel(format!("Matrix dimensions {}x{} overflow", m, n))
         })?;
-        let n_u = usize::try_from(n).map_err(|_| {
-            FastTextError::InvalidModel(format!("Matrix column count {} is too large", n))
-        })?;
-        m_u.checked_mul(n_u).ok_or_else(|| {
-            FastTextError::InvalidModel(format!(
-                "Matrix dimensions {}x{} would overflow usize",
-                m, n
-            ))
-        })?;
+        reader.ensure(size, 4, &format!("{}x{} matrix", m, n))?;
+        let size = usize::try_from(size)
+            .ok()
+            .filter(|&s| s <= isize::MAX as usize / 4)
+            .ok_or_else(|| {
+                FastTextError::InvalidModel(format!("Matrix dimensions {}x{} are too large", m, n))
+            })?;
+        if reader.remaining().is_none() && size > (1 << 20) {
+            let data = utils::read_f32_vec(reader, size)?;
+            return Ok(DenseMatrix::from_data(m, n, &data));
+        }
         let mut mat = DenseMatrix::new(m, n);
         let data = mat.data_mut();
         // Bulk-read the entire matrix as raw bytes, then reinterpret as f32.

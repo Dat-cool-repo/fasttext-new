@@ -271,6 +271,13 @@ impl Model {
         Ok(Self::from_fasttext(ft))
     }
 
+    /// Load a model from the bytes of a `.bin` / `.ftz` file. Corrupt or malicious input gives
+    /// [`Error::Load`], never a panic or an allocation larger than the input implies.
+    pub fn load_bytes(bytes: &[u8]) -> Result<Self> {
+        let ft = FastText::load_from_bytes(bytes).map_err(|e| Error::Load(e.to_string()))?;
+        Ok(Self::from_fasttext(ft))
+    }
+
     /// Wrap an already-loaded crate model.
     pub fn from_fasttext(ft: FastText) -> Self {
         let supervised = ft.args().model == ModelName::Supervised;
@@ -348,9 +355,19 @@ impl Model {
         if !self.supervised {
             return Err(Error::NotSupervised);
         }
-        let k = self.check_k(k)?;
+        self.check_k(k)?;
         let data = std::fs::read(path.as_ref())
             .map_err(|_| Error::Failed("Test file cannot be opened!".into()))?;
+        self.test_bytes(&data, k, threshold)
+    }
+
+    /// [`Model::test`] on the contents of a labelled file (any bytes; invalid UTF-8 inside a
+    /// token is replaced by U+FFFD).
+    pub fn test_bytes(&self, data: &[u8], k: i32, threshold: f32) -> Result<TestResult> {
+        if !self.supervised {
+            return Err(Error::NotSupervised);
+        }
+        let k = self.check_k(k)?;
         let nlabels = self.labels.len();
         // Every '\n' ends a C++ line, so chunks that end right after a '\n' are independent.
         let target = (data.len() / (4 * rayon::current_num_threads().max(1))).max(1 << 16);

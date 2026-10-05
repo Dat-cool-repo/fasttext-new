@@ -26,6 +26,13 @@ use crate::vector::Vector;
 pub const FASTTEXT_FILEFORMAT_MAGIC_INT32: i32 = 793712314;
 /// Current binary format version.
 pub const FASTTEXT_VERSION: i32 = 12;
+/// [fasttext-python-bindings patch] Largest `dim` accepted in a model file.
+const MAX_LOADED_DIM: i32 = 1 << 16;
+/// [fasttext-python-bindings patch] Largest `maxn` / `wordNgrams` accepted in a model file.
+const MAX_LOADED_NGRAM: i32 = 256;
+/// [fasttext-python-bindings patch] Deepest hierarchical-softmax tree accepted in a model file
+/// (Huffman trees over positive counts that fit in an `i64` are at most ~92 levels deep).
+const MAX_HS_DEPTH: usize = 128;
 
 /// A handle to an in-flight training run spawned by [`FastText::spawn_training`].
 ///
@@ -202,13 +209,16 @@ impl FastText {
     ///
     /// Reads: quant_input flag, input matrix, qout flag, output matrix.
     /// Returns `(input_dense, input_quant, qout, output_dense, output_quant)`.
-    fn load_matrices<R: Read>(reader: &mut R, dict: &Dictionary) -> Result<LoadedMatrices> {
+    fn load_matrices<R: Read>(
+        reader: &mut utils::ModelReader<R>,
+        dict: &Dictionary,
+    ) -> Result<LoadedMatrices> {
         let quant_input = utils::read_bool(reader)?;
 
         let (input_dense, input_quant) = if !quant_input {
-            (DenseMatrix::load(reader)?, None)
+            (DenseMatrix::load_from(reader)?, None)
         } else {
-            let qm = QuantMatrix::load(reader)?;
+            let qm = QuantMatrix::load_from(reader)?;
             (DenseMatrix::new(0, 0), Some(qm))
         };
 
@@ -224,10 +234,10 @@ impl FastText {
         let qout = utils::read_bool(reader)?;
 
         let (output_dense, output_quant) = if quant_input && qout {
-            let qm = QuantMatrix::load(reader)?;
+            let qm = QuantMatrix::load_from(reader)?;
             (DenseMatrix::new(0, 0), Some(qm))
         } else {
-            (DenseMatrix::load(reader)?, None)
+            (DenseMatrix::load_from(reader)?, None)
         };
 
         Ok(LoadedMatrices {
@@ -274,6 +284,23 @@ impl FastText {
     /// 7. qout (bool → stored in args.qout)
     /// 8. Output matrix
     pub fn load<R: Read>(reader: &mut R) -> Result<Self> {
+        Self::load_from(&mut utils::ModelReader::new(reader, None))
+    }
+
+    /// [fasttext-python-bindings patch] Load a model from an in-memory `.bin` / `.ftz` image.
+    pub fn load_from_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::load_from(&mut utils::ModelReader::new(
+            bytes,
+            Some(bytes.len() as u64),
+        ))
+    }
+
+    /// [fasttext-python-bindings patch] [`Self::load`] hardened against corrupt or malicious
+    /// files: every size declared in the file is checked against the bytes that remain before
+    /// it is allocated (when the length is known), and the loaded parts are checked for the
+    /// consistency that prediction relies on ([`Self::validate_loaded`]), so a bad file gives
+    /// `InvalidModel` instead of a panic, an out-of-bounds access or a huge allocation.
+    fn load_from<R: Read>(reader: &mut utils::ModelReader<R>) -> Result<Self> {
         let version = Self::validate_header(reader)?;
 
         // Read Args block with backward compatibility
@@ -282,14 +309,16 @@ impl FastText {
         if version == 11 && args.model == ModelName::Supervised {
             args.maxn = 0;
         }
+        Self::validate_loaded_args(&args)?;
 
         // Read Dictionary block
-        let dict = Dictionary::load_from_reader(reader, Arc::new(args.clone()))?;
+        let dict = Dictionary::load_from(reader, Arc::new(args.clone()))?;
 
         // Read matrices (input, output, quant flags)
         let matrices = Self::load_matrices(reader, &dict)?;
         args.qout = matrices.qout;
         let quant = matrices.input_quant.is_some();
+        Self::validate_loaded(&args, &dict, &matrices, reader.len_or_position())?;
 
         // Build inference model
         let input = Arc::new(matrices.input_dense);
@@ -313,11 +342,123 @@ impl FastText {
         })
     }
 
+    /// [fasttext-python-bindings patch] Arguments of a loaded model that inference relies on.
+    /// The bounds are far above anything fastText is used with (C++ defaults: dim 100, maxn 6,
+    /// wordNgrams 1-5) and keep the per-token work and per-call buffers bounded.
+    fn validate_loaded_args(args: &Args) -> Result<()> {
+        let check = |what: &str, v: i32, ok: bool| {
+            if ok {
+                Ok(())
+            } else {
+                Err(FastTextError::InvalidModel(format!(
+                    "Invalid model: {what} = {v} is out of range"
+                )))
+            }
+        };
+        check("dim", args.dim, (1..=MAX_LOADED_DIM).contains(&args.dim))?;
+        check("bucket", args.bucket, args.bucket >= 0)?;
+        check("maxn", args.maxn, args.maxn <= MAX_LOADED_NGRAM)?;
+        check(
+            "wordNgrams",
+            args.word_ngrams,
+            args.word_ngrams <= MAX_LOADED_NGRAM,
+        )
+    }
+
+    /// [fasttext-python-bindings patch] Shape checks after loading (C++ trusts the file):
+    ///
+    /// * every row id the dictionary can produce (`nwords + bucket`, or the pruned n-gram
+    ///   rows) exists in the input matrix, which has `dim` columns;
+    /// * the output matrix has one row per label (supervised) or word (cbow / skipgram);
+    /// * matrices dequantized or precomputed later (`qout` output for hs / ns, normalized
+    ///   word vectors) stay proportional to the file size;
+    /// * the hierarchical-softmax tree built from the counts is not degenerate.
+    fn validate_loaded(
+        args: &Args,
+        dict: &Dictionary,
+        m: &LoadedMatrices,
+        file_len: u64,
+    ) -> Result<()> {
+        let err = |msg: String| Err(FastTextError::InvalidModel(msg));
+        let dim = args.dim as i64;
+        let nwords = dict.nwords() as i64;
+        let nlabels = dict.nlabels() as i64;
+        if nwords + args.bucket as i64 > i32::MAX as i64 {
+            return err(format!(
+                "Invalid model: nwords + bucket = {} does not fit in 32 bits",
+                nwords + args.bucket as i64
+            ));
+        }
+        let needed_rows = if dict.is_pruned() {
+            let max_row = dict.pruneidx().values().map(|&v| v as i64 + 1).max();
+            nwords + max_row.unwrap_or(0)
+        } else {
+            nwords + args.bucket as i64
+        };
+        let (in_rows, in_cols) = match &m.input_quant {
+            Some(q) => (q.rows(), q.cols()),
+            None => (m.input_dense.rows(), m.input_dense.cols()),
+        };
+        if in_cols != dim || in_rows < needed_rows {
+            return err(format!(
+                "Invalid model: input matrix is {in_rows}x{in_cols}, expected at least \
+                 {needed_rows}x{dim} (nwords={nwords}, bucket={})",
+                args.bucket
+            ));
+        }
+        let out_rows_expected = if args.model == ModelName::Supervised {
+            nlabels
+        } else {
+            nwords
+        };
+        let (out_rows, out_cols) = match &m.output_quant {
+            Some(q) => (q.rows(), q.cols()),
+            None => (m.output_dense.rows(), m.output_dense.cols()),
+        };
+        if out_cols != dim || out_rows != out_rows_expected {
+            return err(format!(
+                "Invalid model: output matrix is {out_rows}x{out_cols}, expected \
+                 {out_rows_expected}x{dim}"
+            ));
+        }
+        // Derived dense matrices: a quantized file stores about one byte per `dsub` values.
+        let budget = 64u64.saturating_mul(file_len).saturating_add(256 << 20);
+        let derived = |rows: i64| (rows.max(0) as u64).saturating_mul(dim as u64 * 4);
+        if m.input_quant.is_some() && derived(nwords) > budget {
+            return err(format!(
+                "Invalid model: {nwords} words x {dim} dimensions is too large for a \
+                 {file_len}-byte quantized model"
+            ));
+        }
+        if m.output_quant.is_some() && derived(out_rows) > budget {
+            return err(format!(
+                "Invalid model: a {out_rows}x{dim} quantized output matrix is too large for a \
+                 {file_len}-byte model"
+            ));
+        }
+        if args.loss == LossName::HierarchicalSoftmax {
+            let counts = if args.model == ModelName::Supervised {
+                dict.get_counts(EntryType::Label)
+            } else {
+                dict.get_counts(EntryType::Word)
+            };
+            let depth = crate::loss::huffman_max_depth(&counts);
+            if depth > MAX_HS_DEPTH {
+                return err(format!(
+                    "Invalid model: the hierarchical-softmax tree built from the counts is \
+                     {depth} levels deep (corrupt counts?)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Load a model from a file path.
     pub fn load_model(path: impl AsRef<Path>) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(FastTextError::IoError)?;
-        let mut reader = BufReader::new(file);
-        Self::load(&mut reader)
+        // [fasttext-python-bindings patch] The file length bounds every declared size.
+        let len = file.metadata().map(|m| m.len()).ok();
+        Self::load_from(&mut utils::ModelReader::new(BufReader::new(file), len))
     }
 
     /// Save the model to a binary writer.
@@ -421,18 +562,23 @@ impl FastText {
     /// [fasttext-python-bindings patch] Add the input-matrix rows `ids` to `out`
     /// (C++ `FastText::addInputVector`), for dense and quantized models alike.
     ///
+    /// Ids outside the matrix add nothing: a label's own id (`nwords + label index`, which C++
+    /// `getWordVector("__label__x")` also reads) is past the last row when the model has fewer
+    /// buckets than labels, e.g. `bucket = 0`; C++ reads out of bounds there.
+    ///
     /// # Panics
-    /// Panics if `out.len()` differs from the model dimension or an id is out of range.
+    /// Panics if `out.len()` differs from the model dimension.
     pub fn add_input_rows(&self, ids: &[i32], out: &mut [f32]) {
         if let Some(ref qi) = self.quant_input {
             let mut v = Vector::new(out.len());
             v.data_mut().copy_from_slice(out);
-            for &id in ids {
+            for &id in ids.iter().filter(|&&id| id >= 0 && (id as i64) < qi.rows()) {
                 qi.add_row_to_vector(&mut v, id, 1.0);
             }
             out.copy_from_slice(v.data());
         } else {
-            for &id in ids {
+            let rows = self.input.rows();
+            for &id in ids.iter().filter(|&&id| id >= 0 && (id as i64) < rows) {
                 for (o, &x) in out.iter_mut().zip(self.input.row(id as i64)) {
                     *o += x;
                 }

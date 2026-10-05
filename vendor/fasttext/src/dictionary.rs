@@ -1204,25 +1204,83 @@ impl Dictionary {
     ///
     /// After loading, initializes discard table, n-grams, and rebuilds word2int.
     pub fn load_from_reader<R: Read>(reader: &mut R, args: Arc<Args>) -> Result<Self> {
+        Self::load_from(&mut utils::ModelReader::new(reader, None), args)
+    }
+
+    /// [fasttext-python-bindings patch] [`Self::load_from_reader`] with the declared sizes
+    /// checked against the bytes left in the file before anything is allocated, and the
+    /// structure the rest of the crate relies on validated: `size == nwords + nlabels`, the
+    /// `nwords` words first and then the labels (C++ `threshold` order), non-negative
+    /// `pruneidx` rows, and a bounded number of precomputed character n-grams.
+    pub fn load_from<R: Read>(reader: &mut utils::ModelReader<R>, args: Arc<Args>) -> Result<Self> {
         let size = utils::read_i32(reader)?;
         let nwords = utils::read_i32(reader)?;
         let nlabels = utils::read_i32(reader)?;
         let ntokens = utils::read_i64(reader)?;
         let pruneidx_size = utils::read_i64(reader)?;
 
-        if size < 0 || nwords < 0 || nlabels < 0 {
+        if size < 0 || nwords < 0 || nlabels < 0 || size as i64 != nwords as i64 + nlabels as i64 {
             return Err(FastTextError::InvalidModel(format!(
                 "Invalid dictionary dimensions: size={}, nwords={}, nlabels={}",
                 size, nwords, nlabels
             )));
         }
+        // An entry is at least a NUL terminator, an i64 count and a type byte.
+        reader.ensure(size as u64, 10, "dictionary")?;
 
-        let mut words = Vec::with_capacity(size as usize);
-        for _ in 0..size {
-            words.push(Self::read_entry_from_reader(reader)?);
+        let mut words = Vec::with_capacity((size as usize).min(1 << 16));
+        for i in 0..size {
+            let entry = Self::read_entry_from_reader(reader)?;
+            let expected = if i < nwords {
+                EntryType::Word
+            } else {
+                EntryType::Label
+            };
+            if entry.entry_type != expected {
+                return Err(FastTextError::InvalidModel(format!(
+                    "Invalid dictionary: entry {} is a {:?} but the first {} entries must be \
+                     words and the rest labels",
+                    i, entry.entry_type, nwords
+                )));
+            }
+            words.push(entry);
         }
 
+        if pruneidx_size > 0 {
+            reader.ensure(pruneidx_size as u64, 8, "pruned n-gram index")?;
+        }
         let pruneidx = Self::read_pruneidx(reader, pruneidx_size)?;
+        // Duplicate keys collapse in the map; keep the count consistent with it so that the
+        // model saves a file that loads again.
+        let pruneidx_size = if pruneidx_size > 0 {
+            pruneidx.len() as i64
+        } else {
+            pruneidx_size
+        };
+        if pruneidx.values().any(|&v| v < 0) {
+            return Err(FastTextError::InvalidModel(
+                "Invalid dictionary: negative row in the pruned n-gram index".to_string(),
+            ));
+        }
+
+        // `init_ngrams` stores every character n-gram id of every word; bound that work and
+        // memory (a long word with a huge `maxn` is quadratic) relative to the file size.
+        if args.maxn > 0 && args.bucket > 0 {
+            let maxn = args.maxn as u64;
+            let budget = 16 * reader.len_or_position() + (1 << 26);
+            let mut total = 0u64;
+            for e in &words {
+                let nchars = e.bytes().iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u64 + 2;
+                total = total.saturating_add(nchars.saturating_mul(nchars.min(maxn)));
+            }
+            if total > budget {
+                return Err(FastTextError::InvalidModel(format!(
+                    "Invalid model: the dictionary would expand to about {} character n-grams \
+                     (maxn={})",
+                    total, args.maxn
+                )));
+            }
+        }
 
         let mut dict = Dictionary::new_with_capacity(args, 1);
         dict.words = words;

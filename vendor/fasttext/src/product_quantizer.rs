@@ -431,6 +431,13 @@ impl ProductQuantizer {
     ///
     /// Reads the same binary format as `save`.
     pub fn load<R: Read>(reader: &mut R) -> Result<Self> {
+        Self::load_from(&mut utils::ModelReader::new(reader, None))
+    }
+
+    /// [fasttext-python-bindings patch] [`Self::load`] with the centroid table size checked
+    /// against the bytes left in the file before allocating (`dim * KSUB` used to overflow
+    /// `i32`).
+    pub fn load_from<R: Read>(reader: &mut utils::ModelReader<R>) -> Result<Self> {
         let dim = utils::read_i32(reader)?;
         let nsubq = utils::read_i32(reader)?;
         let dsub = utils::read_i32(reader)?;
@@ -442,11 +449,9 @@ impl ProductQuantizer {
             ));
         }
 
-        let centroids_len = (dim * KSUB) as usize;
-        let mut centroids = vec![0.0f32; centroids_len];
-        for v in centroids.iter_mut() {
-            *v = utils::read_f32(reader)?;
-        }
+        let centroids_len = dim as u64 * KSUB as u64;
+        reader.ensure(centroids_len, 4, "product quantizer centroids")?;
+        let centroids = utils::read_f32_vec(reader, centroids_len as usize)?;
 
         Ok(ProductQuantizer {
             dim,
@@ -456,6 +461,27 @@ impl ProductQuantizer {
             centroids,
             rng: MinstdRng::new(SEED),
         })
+    }
+
+    /// [fasttext-python-bindings patch] Check the layout that `get_centroids` / `addcode` /
+    /// `mulcode` rely on: `nsubq - 1` sub-quantizers of `dsub` dimensions plus a last one of
+    /// `lastdsub` (`1 <= lastdsub <= dsub`) cover exactly `dim`. A model file that breaks it
+    /// would make decoding index out of bounds.
+    pub fn validate(&self, what: &str) -> Result<()> {
+        let covered = (self.nsubq as i64 - 1) * self.dsub as i64 + self.lastdsub as i64;
+        if self.nsubq < 1
+            || self.dsub < 1
+            || self.lastdsub < 1
+            || self.lastdsub > self.dsub
+            || covered != self.dim as i64
+            || self.centroids.len() != self.dim as usize * KSUB as usize
+        {
+            return Err(FastTextError::InvalidModel(format!(
+                "{}: inconsistent product quantizer (dim={}, nsubq={}, dsub={}, lastdsub={})",
+                what, self.dim, self.nsubq, self.dsub, self.lastdsub
+            )));
+        }
+        Ok(())
     }
 }
 

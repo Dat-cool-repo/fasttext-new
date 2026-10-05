@@ -47,7 +47,7 @@ pub const NEGATIVE_TABLE_SIZE: i64 = 10_000_000;
 /// threshold comparisons are bit-identical to C++ fastText.
 #[inline]
 pub fn std_log(x: f32) -> f32 {
-    ((x as f64) + 1e-5).ln() as f32
+    crate::utils::ln((x as f64) + 1e-5) as f32
 }
 
 // [fasttext-python-bindings patch] libstdc++-compatible binary heap.
@@ -565,6 +565,11 @@ impl HierarchicalSoftmaxLoss {
 
     /// Build the Huffman tree nodes from frequency counts.
     fn build_huffman_nodes(&mut self, counts: &[i64]) {
+        // [fasttext-python-bindings patch] `2 * 0 - 1` wrapped to a huge allocation.
+        if self.osz <= 0 {
+            self.tree = Vec::new();
+            return;
+        }
         let n = (2 * self.osz - 1) as usize;
         self.tree = vec![
             HsNode {
@@ -587,7 +592,13 @@ impl HierarchicalSoftmaxLoss {
             let i = i as usize;
             let mut mini = [0i32; 2];
             for mini_j in mini.iter_mut().take(2) {
-                if leaf >= 0 && self.tree[leaf as usize].count < self.tree[node as usize].count {
+                // [fasttext-python-bindings patch] `node >= i` means no internal node is ready
+                // yet: take a leaf. C++ relies on the 1e15 sentinel count of unbuilt nodes
+                // instead, which reads past the tree when a count is larger than it.
+                if leaf >= 0
+                    && (node as usize >= i
+                        || self.tree[leaf as usize].count < self.tree[node as usize].count)
+                {
                     *mini_j = leaf;
                     leaf -= 1;
                 } else {
@@ -597,8 +608,10 @@ impl HierarchicalSoftmaxLoss {
             }
             self.tree[i].left = mini[0];
             self.tree[i].right = mini[1];
-            self.tree[i].count =
-                self.tree[mini[0] as usize].count + self.tree[mini[1] as usize].count;
+            // [fasttext-python-bindings patch] saturating: counts come from the model file.
+            self.tree[i].count = self.tree[mini[0] as usize]
+                .count
+                .saturating_add(self.tree[mini[1] as usize].count);
             self.tree[mini[0] as usize].parent = i as i32;
             self.tree[mini[1] as usize].parent = i as i32;
             self.tree[mini[1] as usize].binary = true;
@@ -630,42 +643,46 @@ impl HierarchicalSoftmaxLoss {
         &self,
         k: usize,
         threshold: f32,
-        node: usize,
+        root: usize,
         score: f32,
         heap: &mut Predictions,
         hidden: &Vector,
     ) {
         let log_threshold = std_log(threshold);
-        if score < log_threshold {
-            return;
-        }
-        // [fasttext-python-bindings patch] libstdc++ heap, exactly like C++ `dfs`.
-        if heap.len() == k && !heap.is_empty() && score < heap[0].0 {
-            return;
-        }
-
-        let n = &self.tree[node];
-        if n.left == -1 && n.right == -1 {
-            heap.push((score, node as i32));
-            cpp_push_heap(heap);
-            if heap.len() > k {
-                cpp_pop_heap(heap);
-                heap.pop();
+        // [fasttext-python-bindings patch] An explicit stack instead of recursion: a model file
+        // can declare label counts that make the Huffman tree a chain as deep as the number of
+        // labels, which overflowed the thread stack. Popping the left child first visits the
+        // nodes in exactly the order of C++ `dfs`, so the results are unchanged.
+        let mut stack: Vec<(usize, f32)> = vec![(root, score)];
+        while let Some((node, score)) = stack.pop() {
+            if score < log_threshold {
+                continue;
             }
-            return;
+            // [fasttext-python-bindings patch] libstdc++ heap, exactly like C++ `dfs`.
+            if heap.len() == k && !heap.is_empty() && score < heap[0].0 {
+                continue;
+            }
+
+            let n = &self.tree[node];
+            if n.left == -1 && n.right == -1 {
+                heap.push((score, node as i32));
+                cpp_push_heap(heap);
+                if heap.len() > k {
+                    cpp_pop_heap(heap);
+                    heap.pop();
+                }
+                continue;
+            }
+
+            // Internal node: exact sigmoid of wo[node - osz] · hidden
+            // (C++: `f = 1. / (1 + std::exp(-f))`, i.e. the division happens in double).
+            let matrix_row = node as i32 - self.osz;
+            let f_raw = self.base.wo.dot_row(hidden, matrix_row as i64);
+            let f = (1.0_f64 / (1.0_f32 + crate::utils::expf(-f_raw)) as f64) as f32;
+
+            stack.push((n.right as usize, score + std_log(f)));
+            stack.push((n.left as usize, score + std_log(1.0 - f)));
         }
-
-        // Internal node: exact sigmoid of wo[node - osz] · hidden
-        // (C++: `f = 1. / (1 + std::exp(-f))`, i.e. the division happens in double).
-        let matrix_row = node as i32 - self.osz;
-        let f_raw = self.base.wo.dot_row(hidden, matrix_row as i64);
-        let f = (1.0_f64 / (1.0_f32 + (-f_raw).exp()) as f64) as f32;
-
-        let left = self.tree[node].left as usize;
-        let right = self.tree[node].right as usize;
-
-        self.dfs_with_hidden(k, threshold, left, score + std_log(1.0 - f), heap, hidden);
-        self.dfs_with_hidden(k, threshold, right, score + std_log(f), heap, hidden);
     }
 
     /// Return the code length (tree depth) for leaf `i`.
@@ -715,24 +732,58 @@ impl Loss for HierarchicalSoftmaxLoss {
                 .zip(code.iter())
                 .fold(0.0f32, |acc, (&node, &c)| {
                     let dot = self.base.wo.dot_row(&state.hidden, node as i64);
-                    let f = 1.0_f32 / (1.0 + (-dot).exp()); // exact sigmoid
+                    let f = 1.0_f32 / (1.0 + crate::utils::expf(-dot)); // exact sigmoid
                     if c {
                         acc + std_log(f)
                     } else {
                         acc + std_log(1.0 - f)
                     }
                 });
-            state.output[i] = log_prob.exp();
+            state.output[i] = crate::utils::expf(log_prob);
         }
     }
 
     fn predict(&self, k: i32, threshold: f32, heap: &mut Predictions, state: &mut State) {
+        // [fasttext-python-bindings patch] No labels (possible in a corrupt model file): no tree.
+        if self.osz <= 0 {
+            return;
+        }
         let root = (2 * self.osz - 2) as usize;
         let hidden = &state.hidden;
         self.dfs_with_hidden(k as usize, threshold, root, 0.0, heap, hidden);
         // [fasttext-python-bindings patch] C++ `std::sort_heap` (descending, same tie order).
         cpp_sort_heap(heap);
     }
+}
+
+/// [fasttext-python-bindings patch] Depth of the deepest leaf of the Huffman tree that
+/// [`HierarchicalSoftmaxLoss`] builds for `counts` (0 for fewer than two leaves). Used to reject
+/// model files whose counts (zero, negative or unsorted) degenerate the tree into a chain,
+/// which makes the paths quadratic in the number of labels.
+pub(crate) fn huffman_max_depth(counts: &[i64]) -> usize {
+    if counts.len() < 2 || counts.len() > i32::MAX as usize / 2 {
+        return 0;
+    }
+    let mut hs = HierarchicalSoftmaxLoss {
+        base: BinaryLogisticBase::new(
+            Arc::new(DenseMatrix::new(0, 0)),
+            Arc::new(LossTables::new()),
+        ),
+        osz: counts.len() as i32,
+        paths: Vec::new(),
+        codes: Vec::new(),
+        tree: Vec::new(),
+    };
+    hs.build_huffman_nodes(counts);
+    // A parent always has a larger index than its children, so one backward pass suffices.
+    let mut depth = vec![0usize; hs.tree.len()];
+    for i in (0..hs.tree.len()).rev() {
+        let parent = hs.tree[i].parent;
+        if parent >= 0 {
+            depth[i] = depth[parent as usize] + 1;
+        }
+    }
+    depth[..counts.len()].iter().copied().max().unwrap_or(0)
 }
 
 // SoftmaxLoss

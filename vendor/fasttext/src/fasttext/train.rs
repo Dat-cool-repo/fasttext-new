@@ -100,7 +100,25 @@ impl FastText {
     /// Validates that the file is non-empty and, for supervised models,
     /// that at least one label is present.
     fn build_vocabulary(args: &Args, args_arc: &Arc<Args>) -> Result<Dictionary> {
-        let mut dict = Dictionary::new(Arc::clone(args_arc));
+        // [fasttext-python-bindings patch] Size the vocabulary hash table to the input instead
+        // of always allocating C++'s 30M slots (120 MB, filled on every call). A file of `n`
+        // bytes has at most `n / 2 + 1` distinct tokens, so a table of `2n` slots (plus the
+        // pretrained-vector words) never reaches the 75% pruning point of `read_from_file`,
+        // exactly like the 30M table: same vocabulary, much faster on small files.
+        let file_len = |p: &Path| {
+            std::fs::metadata(p)
+                .map(|m| m.len())
+                .unwrap_or(u64::MAX / 4)
+        };
+        let mut bytes = file_len(&args.input);
+        if !args.pretrained_vectors.as_os_str().is_empty() {
+            bytes = bytes.saturating_add(file_len(&args.pretrained_vectors));
+        }
+        let capacity = bytes
+            .saturating_mul(2)
+            .saturating_add(1024)
+            .min(crate::dictionary::MAX_VOCAB_SIZE as u64) as usize;
+        let mut dict = Dictionary::new_with_capacity(Arc::clone(args_arc), capacity);
         {
             let file = std::fs::File::open(&args.input).map_err(FastTextError::IoError)?;
             let mut reader = BufReader::new(file);
@@ -451,10 +469,21 @@ impl FastText {
 
     /// Parse one line of a `.vec` file into `(word, vector)`.
     fn parse_pretrained_line(line: &str, dim: usize) -> Result<(String, Vec<f32>)> {
-        let mut parts = line.split_whitespace();
+        // [fasttext-python-bindings patch] Split on the C `isspace` set like C++ `operator>>`
+        // (`split_whitespace` also split words on Unicode spaces such as U+00A0).
+        let mut parts = line
+            .split([' ', '\t', '\n', '\r', '\x0b', '\x0c'])
+            .filter(|p| !p.is_empty());
         let word = parts.next().ok_or_else(|| {
             FastTextError::InvalidModel("Missing word in pretrained vectors line".to_string())
         })?;
+        // [fasttext-python-bindings patch] A NUL byte cannot be part of a fastText word (the
+        // model file stores words NUL-terminated, so saving it would corrupt the model).
+        if word.contains('\0') {
+            return Err(FastTextError::InvalidModel(
+                "Invalid word (contains a NUL byte) in pretrained vectors".to_string(),
+            ));
+        }
 
         let mut vec = Vec::with_capacity(dim);
         for j in 0..dim {
@@ -499,7 +528,8 @@ impl FastText {
         let (n, vec_dim) = Self::parse_vec_header(&header, args.dim)?;
         let dim = vec_dim as usize;
 
-        let mut out = Vec::with_capacity(n.max(0) as usize);
+        // [fasttext-python-bindings patch] `n` comes from the file: don't reserve for it.
+        let mut out = Vec::with_capacity(n.clamp(0, 1 << 16) as usize);
         for _ in 0..n {
             let line = lines
                 .next()
