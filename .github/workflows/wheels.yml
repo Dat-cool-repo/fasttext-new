@@ -2,8 +2,9 @@
 #
 # * abi3 wheels (one per platform, CPython >= 3.9): Linux x86_64 / aarch64 (manylinux),
 #   macOS x86_64 / arm64, Windows x86_64.
-# * Free-threaded wheels (cp313t, cp314t): PyO3 0.29 builds a version-specific free-threaded
-#   extension for them (abi3 does not cover free-threaded CPython before 3.15's abi3t).
+# * Free-threaded wheel (cp314t): maturin builds a version-specific (non-abi3) extension for it
+#   automatically, since abi3 does not cover free-threaded CPython before 3.15's abi3t.
+#   No cp313t wheel: PyO3 0.29 only supports the free-threaded build from CPython 3.14 on.
 # * sdist.
 #
 # Nothing is published from here: the wheels are uploaded as workflow artifacts only.
@@ -62,12 +63,12 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: "2_28"
           args: --release --out dist
-      - name: free-threaded wheels (3.13t, 3.14t)
+      - name: free-threaded wheel (3.14t)
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           manylinux: "2_28"
-          args: --release --out dist -i python3.13t -i python3.14t
+          args: --release --out dist -i python3.14t
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -87,7 +88,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: |
-            3.13t
             3.14t
             3.12
       - name: abi3 wheel
@@ -95,11 +95,11 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist -i python3.12
-      - name: free-threaded wheels (3.13t, 3.14t)
+      - name: free-threaded wheel (3.14t)
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -i python3.13t -i python3.14t
+          args: --release --out dist -i python3.14t
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.target }}
@@ -113,7 +113,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: |
-            3.13t
             3.14t
             3.12
           architecture: x64
@@ -122,11 +121,11 @@ jobs:
         with:
           target: x64
           args: --release --out dist -i python3.12
-      - name: free-threaded wheels (3.13t, 3.14t)
+      - name: free-threaded wheel (3.14t)
         uses: PyO3/maturin-action@v1
         with:
           target: x64
-          args: --release --out dist -i python3.13t -i python3.14t
+          args: --release --out dist -i python3.14t
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-x64
