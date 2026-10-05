@@ -1,10 +1,12 @@
 # Checks against the C++ package that need downloads or take a while. Manual only:
-#   gh workflow run reference [-f only=golden-tiny|full-suite|real-data]
+#   gh workflow run reference [-f only=golden-tiny|full-suite|real-data|readme]
 #
 # * golden-tiny: regenerates tests/data/golden/tiny_*.json (C++ outputs of the committed tiny
 #   models) and uploads them as an artifact.
-# * full-suite: scripts/setup_env.sh + the whole pytest suite (parity, training quality,
-#   quantization interop, golden files) on Linux with the C++ package.
+# * full-suite: the README development steps on Linux with the C++ package: scripts/setup_env.sh,
+#   the whole pytest suite (parity, training quality, quantization interop, golden files),
+#   cargo_check.sh, upstream_tests.sh, build.sh and the cross-compiled Windows wheel.
+# * readme: the README install and quick-start steps, as written, in fresh virtualenvs.
 # * real-data: language identification with lid.176.bin / lid.176.ftz on ~1 GB of FineWeb /
 #   FineWeb-2 web text with both implementations (exact agreement, throughput, peak RSS), and a
 #   17-language classifier trained on the same data with both.
@@ -20,7 +22,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, golden-tiny, full-suite, real-data]
+        options: [all, golden-tiny, full-suite, real-data, readme]
 
 permissions:
   contents: read
@@ -68,11 +70,64 @@ jobs:
       - run: bash scripts/setup_env.sh
       - run: bash scripts/test.sh -q -rs -s 2>&1 | tee pytest.log
       - run: grep -E "^(TRAIN|QUANT|PRETRAINED)|passed|failed" pytest.log
+      # The other README development steps, as written
+      - run: bash scripts/cargo_check.sh
+      - run: bash scripts/upstream_tests.sh
+      - run: bash scripts/build.sh
+      - name: cross-compiled Windows wheel (scripts/build_windows_wheel.sh)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q gcc-mingw-w64-x86-64
+          rustup target add x86_64-pc-windows-gnu
+          bash scripts/build_windows_wheel.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-gnu-wheel
+          path: dist/*win_amd64.whl
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: full-suite-log
           path: pytest.log
+
+  readme:
+    # The README's install and quick-start steps, as written, in fresh virtualenvs.
+    if: inputs.only == 'all' || inputs.only == 'readme'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: checkout
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: data for the examples
+        run: |
+          mkdir work && cd work
+          for f in lid.176.ftz lid.176.bin; do
+            curl -fsSL --retry 3 -O https://dl.fbaipublicfiles.com/fasttext/supervised-models/$f
+          done
+          curl -fsSL --retry 3 https://dl.fbaipublicfiles.com/fasttext/data/cooking.stackexchange.tar.gz | tar xz
+          head -n 12404 cooking.stackexchange.txt > train.txt
+          tail -n 3000 cooking.stackexchange.txt > valid.txt
+          sed 's/__label__[^ ]* //g' train.txt > corpus.txt
+      - name: pip install git+https://... and the quick start
+        run: |
+          python -m venv v1 && . v1/bin/activate
+          pip install "git+https://github.com/Dat-cool-repo/fasttext-new"
+          python checkout/scripts/check_readme.py work
+      - name: from a clone (pip install . / maturin develop --release)
+        run: |
+          git clone https://github.com/Dat-cool-repo/fasttext-new
+          cd fasttext-new
+          python -m venv ../v2 && . ../v2/bin/activate
+          pip install .
+          python -c "import fasttext_new; print(fasttext_new.__version__)"
+          deactivate
+          python -m venv ../v3 && . ../v3/bin/activate
+          pip install maturin
+          maturin develop --release
+          python -c "import fasttext_new; print(fasttext_new.load_model('../work/lid.176.ftz').predict('Hola mundo'))"
 
   real-data:
     if: inputs.only == 'all' || inputs.only == 'real-data'
