@@ -16,6 +16,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "Seconds to run each fuzz target (default 60)"
+        required: false
+        default: "60"
 
 permissions:
   contents: read
@@ -47,8 +52,18 @@ jobs:
           PYO3_PYTHON: python
 
   fuzz:
-    name: fuzz smoke test (60 s per target)
+    # 60 s per target on every push / PR. Run the workflow by hand with `fuzz_seconds` for a
+    # longer campaign (e.g. `gh workflow run wheels -f fuzz_seconds=1500`).
+    name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: load_model, max_len: 65536 }
+          - { target: predict, max_len: 8192 }
+          - { target: train, max_len: 4096 }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -58,20 +73,36 @@ jobs:
       - name: build
         working-directory: fuzz
         # (the prebuilt cargo-fuzz is a musl binary; build for the glibc target)
-        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
-      - name: run
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu ${{ matrix.target }}
+      - name: seed corpus
         working-directory: fuzz
         run: |
-          mkdir -p corpus/load_model corpus/predict corpus/train
-          cp ../tests/data/models/tiny_* regressions/load_model/* corpus/load_model/ 2>/dev/null || true
-          cp regressions/predict/* corpus/predict/ 2>/dev/null || true
-          cp regressions/train/* corpus/train/ 2>/dev/null || true
-          printf '\x00\x00apple banana cherry' > corpus/predict/seed
-          printf '\x00\x00\x00__label__a apple banana\n__label__b cherry\n' > corpus/train/seed
-          for t in load_model:65536 predict:8192 train:4096; do
-            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${t%%:*} corpus/${t%%:*} -- -max_total_time=60 \
-              -rss_limit_mb=2048 -timeout=10 -max_len=${t##*:}
-          done
+          mkdir -p corpus/${{ matrix.target }}
+          cp regressions/${{ matrix.target }}/* corpus/${{ matrix.target }}/ 2>/dev/null || true
+          case ${{ matrix.target }} in
+            load_model) cp ../tests/data/models/tiny_* corpus/load_model/ ;;
+            predict) printf '\x00\x00apple banana cherry' > corpus/predict/seed ;;
+            train) head -n 40 ../tests/data/models/train_tiny.txt | sed '1s/^/\x00\x00\x00/' > corpus/train/seed ;;
+          esac
+      - name: fuzz
+        working-directory: fuzz
+        run: |
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} \
+            corpus/${{ matrix.target }} -- -jobs=2 -workers=2 -print_final_stats=1 \
+            -max_total_time=${{ github.event.inputs.fuzz_seconds || 60 }} \
+            -rss_limit_mb=2048 -timeout=10 -max_len=${{ matrix.max_len }} || true
+          tail -n 12 fuzz-*.log
+          if ls artifacts/${{ matrix.target }}/* > /dev/null 2>&1; then
+            echo "::error::fuzzing found crashes"; ls -la artifacts/${{ matrix.target }}; exit 1
+          fi
+      - name: crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: |
+            fuzz/artifacts
+            fuzz/fuzz-*.log
 
   linux:
     name: linux ${{ matrix.target }}
