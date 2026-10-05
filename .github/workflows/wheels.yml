@@ -57,7 +57,8 @@ jobs:
           tool: cargo-fuzz
       - name: build
         working-directory: fuzz
-        run: cargo +nightly fuzz build
+        # (the prebuilt cargo-fuzz is a musl binary; build for the glibc target)
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
       - name: run
         working-directory: fuzz
         run: |
@@ -68,7 +69,7 @@ jobs:
           printf '\x00\x00apple banana cherry' > corpus/predict/seed
           printf '\x00\x00\x00__label__a apple banana\n__label__b cherry\n' > corpus/train/seed
           for t in load_model:65536 predict:8192 train:4096; do
-            cargo +nightly fuzz run ${t%%:*} corpus/${t%%:*} -- -max_total_time=60 \
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${t%%:*} corpus/${t%%:*} -- -max_total_time=60 \
               -rss_limit_mb=2048 -timeout=10 -max_len=${t##*:}
           done
 
