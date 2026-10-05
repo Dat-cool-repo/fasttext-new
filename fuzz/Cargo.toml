@@ -11,10 +11,6 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 fasttext-new = { path = ".." }
-fasttext = "0.8"
-
-# Same vendored, patched crate as the main package.
-[patch.crates-io]
 fasttext = { path = "../vendor/fasttext" }
 
 # Keep the fuzz crate out of the main package's workspace.

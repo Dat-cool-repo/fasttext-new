@@ -12,17 +12,31 @@ description = "Drop-in replacement for the archived `fasttext` Python package, b
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT OR Apache-2.0"
-license-files = ["LICENSE-MIT", "LICENSE-APACHE", "vendor/fasttext/LICENSE"]
+license-files = ["LICENSE-MIT", "LICENSE-APACHE", "vendor/fasttext/LICENSE", "tests/data/golden/NOTICE"]
 authors = [{ name = "Dat-cool-repo" }]
 keywords = ["fasttext", "language-identification", "text-classification", "word-vectors"]
 dependencies = ["numpy>=1.21"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Free Threading :: 2 - Beta",
     "Topic :: Text Processing :: Linguistic",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
 ]
 
 [project.urls]
