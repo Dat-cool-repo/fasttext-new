@@ -4,6 +4,7 @@
 cannot be installed (Windows, macOS CI, free-threaded Python).
 
     python scripts/make_golden.py [DATA_DIR]
+    python scripts/make_golden.py --tiny     # only the tiny models' golden files
 
 * ``tests/data/golden/lid.176.ftz.json`` (checked in, small): the checked-in sentences + edge
   cases.
@@ -148,5 +149,9 @@ def main(data: Path) -> None:
 
 
 if __name__ == "__main__":
-    default = os.environ.get("FASTTEXT_NEW_DATA", HERE / "data")
-    main(Path(sys.argv[1] if len(sys.argv) > 1 else default))
+    if "--tiny" in sys.argv:  # only tests/data/golden/tiny_*.json (no downloaded data needed)
+        texts = (HERE / "tests/data/sentences.txt").read_text(encoding="utf-8").splitlines() + EDGE_CASES
+        write_tiny_goldens(texts, HERE / "tests/data/golden")
+    else:
+        default = os.environ.get("FASTTEXT_NEW_DATA", HERE / "data")
+        main(Path(sys.argv[1] if len(sys.argv) > 1 else default))
