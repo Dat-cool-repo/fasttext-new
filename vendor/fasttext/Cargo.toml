@@ -1,0 +1,29 @@
+# Vendored copy of crates.io `fasttext` 0.8.0 (messense/fasttext-rs, MIT) with fixes, notably
+# quantized (.ftz) prediction for hierarchical-softmax / negative-sampling models.
+# Search for "[fasttext-python-bindings patch]" in src/. Diff: ../fasttext-0.8.0-fixes.patch
+[package]
+name = "fasttext"
+version = "0.8.0"
+edition = "2021"
+license = "MIT"
+description = "fastText pure Rust implementation (vendored + patched)"
+repository = "https://github.com/messense/fasttext-rs"
+publish = false
+autobins = false
+autotests = false
+autobenches = false
+autoexamples = false
+
+[lib]
+name = "fasttext"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+rayon = "1"
+thiserror = "2"
+
+[features]
+# Use the upstream SIMD/FMA dot product (faster for large dims, not bit-identical to C++).
+simd-dot = []

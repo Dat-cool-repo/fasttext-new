@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dat-cool-repo <Dat-cool-repo@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 00:00:00 +0000
+Subject: [PATCH 4/9] Speed up tokenization: incremental n-gram hashing, cheap hasher for pruneidx
+
+* `for_each_ngram` copied every character n-gram into a fresh `Vec` and hashed it from scratch.
+  An n-gram starting at a position only grows, so its FNV-1a hash is now updated incrementally
+  (same values as `utils::hash`) and the n-gram bytes are borrowed from the word.
+* `pruneidx` (consulted once per n-gram of every OOV token in a quantized model) used SipHash.
+  It now uses a cheap multiplicative hasher for its `i32` keys (`PruneIdx` type alias).
+
+Tokenizing for `lid.176.ftz` gets about 3x faster, and its predict throughput goes from below
+C++ to about 2x above it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QeswAUonCzqFJEnwyzk7PA
+---
+
+diff --git a/src/dictionary.rs b/src/dictionary.rs
+--- a/src/dictionary.rs
++++ b/src/dictionary.rs
+@@ -1,6 +1,32 @@
+ // Dictionary: tokenization, vocabulary, subwords, word n-grams, hash table
+ 
+ use std::collections::HashMap;
++
++/// Cheap multiplicative hasher for the `i32` keys of
++/// `pruneidx` (looked up once per character n-gram of every OOV token in `.ftz` models;
++/// SipHash made tokenization ~2x slower than C++'s `std::unordered_map`).
++#[derive(Default, Clone, Copy)]
++pub struct IntHasher(u64);
++
++impl std::hash::Hasher for IntHasher {
++    #[inline]
++    fn finish(&self) -> u64 {
++        self.0
++    }
++    #[inline]
++    fn write(&mut self, bytes: &[u8]) {
++        for &b in bytes {
++            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
++        }
++    }
++    #[inline]
++    fn write_i32(&mut self, i: i32) {
++        self.0 = (i as u32 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
++    }
++}
++
++/// Pruned n-gram bucket -> compact row map.
++pub type PruneIdx = HashMap<i32, i32, std::hash::BuildHasherDefault<IntHasher>>;
+ use std::io::{Read, Write};
+ use std::sync::Arc;
+ 
+@@ -85,7 +111,7 @@
+     /// Prune index size (`PRUNEIDX_NONE` = no pruning, 0+ = pruned).
+     pruneidx_size: i64,
+     /// Prune index mapping (for quantization).
+-    pruneidx: HashMap<i32, i32>,
++    pruneidx: PruneIdx,
+ }
+ 
+ impl Dictionary {
+@@ -109,7 +135,7 @@
+             nlabels: 0,
+             ntokens: 0,
+             pruneidx_size: PRUNEIDX_NONE,
+-            pruneidx: HashMap::new(),
++            pruneidx: PruneIdx::default(),
+             args,
+         }
+     }
+@@ -557,21 +583,24 @@
+                 continue;
+             }
+ 
+-            let mut ngram: Vec<u8> = Vec::new();
++            // The n-gram starting at `i` only grows, so
++            // its FNV-1a hash is updated incrementally (same value as `utils::hash`) and
++            // the bytes are borrowed from `word` instead of copied into a fresh Vec.
++            let mut fnv: u32 = 2_166_136_261;
+             let mut j = i;
+             let mut n: i32 = 1;
+ 
+             while j < n_bytes && n <= maxn {
+-                ngram.push(bytes[j]);
++                fnv = (fnv ^ bytes[j] as i8 as i32 as u32).wrapping_mul(16_777_619);
+                 j += 1;
+                 while j < n_bytes && (bytes[j] & 0xC0) == 0x80 {
+-                    ngram.push(bytes[j]);
++                    fnv = (fnv ^ bytes[j] as i8 as i32 as u32).wrapping_mul(16_777_619);
+                     j += 1;
+                 }
+ 
+                 if n >= minn && !(n == 1 && (i == 0 || j == n_bytes)) {
+-                    let h = (crate::utils::hash(&ngram) % bucket as u32) as i32;
+-                    f(&ngram, h);
++                    let h = (fnv % bucket as u32) as i32;
++                    f(&bytes[i..j], h);
+                 }
+ 
+                 n += 1;
+@@ -994,14 +1023,14 @@
+     }
+ 
+     /// Get the pruneidx (for binary I/O).
+-    pub fn pruneidx(&self) -> &HashMap<i32, i32> {
++    pub fn pruneidx(&self) -> &PruneIdx {
+         &self.pruneidx
+     }
+ 
+     /// Set pruneidx from loaded binary data.
+     pub fn set_pruneidx(&mut self, idx: HashMap<i32, i32>) {
+         self.pruneidx_size = idx.len() as i64;
+-        self.pruneidx = idx;
++        self.pruneidx = idx.into_iter().collect();
+     }
+ 
+     /// Set pruneidx_size directly (for binary I/O loading, including negative sentinel).
+@@ -1119,8 +1148,8 @@
+     }
+ 
+     /// Read pruneidx pairs from binary format.
+-    fn read_pruneidx<R: Read>(reader: &mut R, pruneidx_size: i64) -> Result<HashMap<i32, i32>> {
+-        let mut pruneidx = HashMap::new();
++    fn read_pruneidx<R: Read>(reader: &mut R, pruneidx_size: i64) -> Result<PruneIdx> {
++        let mut pruneidx = PruneIdx::default();
+         if pruneidx_size > 0 {
+             for _ in 0..pruneidx_size {
+                 let first = utils::read_i32(reader)?;
+-- 
+2.43.0
+

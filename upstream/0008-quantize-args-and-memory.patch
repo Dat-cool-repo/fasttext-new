@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dat-cool-repo <Dat-cool-repo@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 00:00:00 +0000
+Subject: [PATCH 8/9] quantize(): keep the retrain arguments like C++, free the dense input matrix
+
+* With `retrain`, C++ overwrites `epoch`, `lr`, `thread` and `verbose` in the model's args
+  (`epoch` is part of the saved file). The crate kept the old values, so a model quantized with
+  `retrain=true, epoch=E` saved a different header than C++.
+* After quantization the dense input matrix was kept alive, although the quantized prediction
+  path never reads it, so a freshly quantized model kept the whole dense matrix (often hundreds
+  of MB) next to the few-MB quantized one. It is now dropped, as C++ moves it into the
+  `QuantMatrix`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QeswAUonCzqFJEnwyzk7PA
+---
+
+diff --git a/src/fasttext/quantize.rs b/src/fasttext/quantize.rs
+--- a/src/fasttext/quantize.rs
++++ b/src/fasttext/quantize.rs
+@@ -76,6 +76,7 @@
+         let mut input_data: Vec<f32> = self.input.data().to_vec();
+ 
+         let cutoff = qargs.cutoff;
++        let mut retrained = false;
+         if cutoff > 0 && cutoff < input_m as usize {
+             let idx = self.select_embeddings(cutoff);
+ 
+@@ -119,6 +120,7 @@
+                 let pruned_dense = DenseMatrix::from_data(pruned_m, input_n, &input_data);
+                 let pruned_arc = Arc::new(pruned_dense);
+                 self.retrain_after_prune(Arc::clone(&pruned_arc), qargs)?;
++                retrained = true;
+                 // After retrain, use the (updated) pruned input data.
+                 input_data = pruned_arc.data().to_vec();
+                 // Update self.input so get_word_vector still works on dense models.
+@@ -147,8 +149,29 @@
+         self.quant = true;
+         let mut new_args = (*self.args).clone();
+         new_args.qout = qargs.qout;
++        // Like C++, a retrain overwrites epoch / lr / thread /
++        // verbose in the model args (`epoch` is part of the saved file).
++        if retrained {
++            new_args.epoch = qargs.epoch;
++            new_args.lr = qargs.lr;
++            new_args.thread = qargs.thread;
++            new_args.verbose = qargs.verbose;
++        }
+         self.args = Arc::new(new_args);
+ 
++        // Drop the dense input matrix (C++ moves it into the
++        // QuantMatrix): the quantized path never reads it, and keeping it held on to the whole
++        // dense matrix (often hundreds of MB) next to the few-MB quantized one.
++        let empty = Arc::new(DenseMatrix::new(0, 0));
++        self.model = Self::build_inference_model(
++            &self.args,
++            &self.dict,
++            &empty,
++            &self.output,
++            &self.loss_tables,
++        );
++        self.input = empty;
++
+         Ok(())
+     }
+ 
+-- 
+2.43.0
+

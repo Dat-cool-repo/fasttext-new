@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dat-cool-repo <Dat-cool-repo@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 00:00:00 +0000
+Subject: [PATCH 1/9] Fix quantized (.ftz) prediction for hierarchical-softmax and negative-sampling models
+
+`predict_raw_quantized` always applied a softmax over the first `nlabels` rows of the output
+matrix. That is only correct for softmax (and the sigmoid for one-vs-all). For hierarchical
+softmax those rows are Huffman-tree nodes, and negative sampling is a binary logistic per label,
+so every HS / NS `.ftz` model predicted garbage. `lid.176.ftz` (the official language-ID model,
+HS) returned `__label__zh` for French text.
+
+Like C++ `Model::predict`, delegate to the model's real loss whenever the output matrix is
+dense (`qout=false`). For HS / NS with a quantized output matrix (`qout=true`), run the loss
+over a dequantized copy of the output matrix, built lazily once (`qout_model`) and reset when
+the model is re-quantized.
+
+Verified against the C++ package: `lid.176.ftz` top-k labels and probabilities are identical
+on 10,121 multilingual lines, as are HS/NS fixture models with and without `qout`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QeswAUonCzqFJEnwyzk7PA
+---
+
+diff --git a/src/fasttext/mod.rs b/src/fasttext/mod.rs
+--- a/src/fasttext/mod.rs
++++ b/src/fasttext/mod.rs
+@@ -167,6 +167,9 @@
+     /// Cached sigmoid/log lookup tables for quantized prediction.
+     /// Shared with loss instances via `Arc` to avoid redundant allocations.
+     pub(super) loss_tables: Arc<LossTables>,
++    /// Lazily-built inference model over a dequantized copy of `quant_output`, used for hierarchical-softmax / negative-sampling prediction when
++    /// `qout=true` (C++ runs the real loss on the quantized output matrix).
++    pub(super) qout_model: std::sync::OnceLock<Model>,
+ }
+ 
+ impl FastText {
+@@ -302,6 +305,7 @@
+             abort_flag: Arc::new(AtomicBool::new(false)),
+             last_train_loss: 0.0,
+             loss_tables,
++            qout_model: std::sync::OnceLock::new(),
+         })
+     }
+ 
+diff --git a/src/fasttext/predict.rs b/src/fasttext/predict.rs
+--- a/src/fasttext/predict.rs
++++ b/src/fasttext/predict.rs
+@@ -139,19 +139,48 @@
+         // Compute hidden representation using quantized input matrix.
+         quant_input.average_rows_to_vector(&mut state.hidden, word_ids);
+ 
+-        // Compute raw output scores.
+-        let osz = nlabels;
+-        match &self.quant_output {
+-            Some(qout) => {
+-                for (i, out) in state.output.data_mut()[..osz].iter_mut().enumerate() {
+-                    *out = qout.dot_row(&state.hidden, i as i64);
+-                }
++        // A softmax (or the OVA sigmoid) over the first `nlabels` output rows is only right
++        // for those losses: for hierarchical softmax the rows are Huffman-tree nodes (e.g.
++        // lid.176.ftz), and negative sampling is a binary logistic. Like C++
++        // `Model::predict`, delegate to the real
++        // loss whenever the output matrix is dense, and to a loss over a dequantized output
++        // matrix for HS / NS with `qout=true`.
++        let mut heap = Predictions::new();
++        match (&self.quant_output, self.args.loss) {
++            (None, _) => {
++                self.model.loss.predict(k, threshold, &mut heap, state);
++                return heap;
+             }
+-            None => {
+-                // Use dense output matrix (qout=false).
+-                for (i, out) in state.output.data_mut()[..osz].iter_mut().enumerate() {
+-                    *out = self.output.dot_row(&state.hidden, i as i64);
+-                }
++            (Some(qout), LossName::HierarchicalSoftmax | LossName::NegativeSampling) => {
++                let model = self.qout_model.get_or_init(|| {
++                    let rows = qout.rows();
++                    let cols = qout.cols();
++                    let mut dense = crate::matrix::DenseMatrix::new(rows, cols);
++                    let mut v = crate::vector::Vector::new(cols as usize);
++                    for i in 0..rows {
++                        v.zero();
++                        qout.add_row_to_vector(&mut v, i as i32, 1.0);
++                        dense.row_mut(i).copy_from_slice(v.data());
++                    }
++                    super::FastText::build_inference_model(
++                        &self.args,
++                        &self.dict,
++                        &self.input,
++                        &std::sync::Arc::new(dense),
++                        &self.loss_tables,
++                    )
++                });
++                model.loss.predict(k, threshold, &mut heap, state);
++                return heap;
++            }
++            _ => {}
++        }
++
++        // Compute raw output scores (softmax / one-vs-all with quantized output).
++        let osz = nlabels;
++        if let Some(qout) = &self.quant_output {
++            for (i, out) in state.output.data_mut()[..osz].iter_mut().enumerate() {
++                *out = qout.dot_row(&state.hidden, i as i64);
+             }
+         }
+ 
+@@ -165,13 +194,12 @@
+                 }
+             }
+             _ => {
+-                // Softmax (and NS, which also uses softmax for prediction).
++                // Softmax (HS / NS are handled above).
+                 utils::softmax_in_place(&mut state.output.data_mut()[..osz]);
+             }
+         }
+ 
+         // Find top-k predictions above threshold.
+-        let mut heap = Predictions::new();
+         find_k_best(k as usize, threshold, &mut heap, &state.output);
+         heap
+     }
+diff --git a/src/fasttext/quantize.rs b/src/fasttext/quantize.rs
+--- a/src/fasttext/quantize.rs
++++ b/src/fasttext/quantize.rs
+@@ -142,6 +142,7 @@
+             // C++ uses dsub=2 and passes the qnorm flag for the output matrix.
+             let quant_out = QuantMatrix::from_dense(&output_data, out_m, out_n, 2, qnorm);
+             self.quant_output = Some(quant_out);
++            self.qout_model = std::sync::OnceLock::new();
+         }
+ 
+         // Mark model as quantized and update args.
+diff --git a/src/fasttext/train.rs b/src/fasttext/train.rs
+--- a/src/fasttext/train.rs
++++ b/src/fasttext/train.rs
+@@ -260,6 +260,7 @@
+             abort_flag,
+             last_train_loss: avg_loss,
+             loss_tables,
++            qout_model: std::sync::OnceLock::new(),
+         })
+     }
+ 
+-- 
+2.43.0
+

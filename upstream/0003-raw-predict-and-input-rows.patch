@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dat-cool-repo <Dat-cool-repo@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 00:00:00 +0000
+Subject: [PATCH 3/9] Add predict_on_words_raw() and add_input_rows() for allocation-free bindings
+
+* `FastText::predict_on_words_raw(word_ids, k, threshold) -> Vec<(log_prob, label_index)>` is
+  `predict_on_words` without allocating a label `String` per prediction. Language bindings can
+  intern the label strings once. The threshold is passed through unclamped like C++: a negative
+  threshold filters nothing, and `std_log(threshold)` becomes NaN, which disables the HS pruning,
+  so `k = -1` returns every label.
+* `FastText::add_input_rows(ids, out)` adds input-matrix rows to `out` for dense and quantized
+  models alike (C++ `addInputVector`). Callers can then compute sentence / word vectors exactly
+  like C++, including for `.ftz` models.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QeswAUonCzqFJEnwyzk7PA
+---
+
+diff --git a/src/fasttext/mod.rs b/src/fasttext/mod.rs
+--- a/src/fasttext/mod.rs
++++ b/src/fasttext/mod.rs
+@@ -414,6 +414,28 @@
+         self.quant_output.as_ref()
+     }
+ 
++    /// Add the input-matrix rows `ids` to `out`
++    /// (C++ `FastText::addInputVector`), for dense and quantized models alike.
++    ///
++    /// # Panics
++    /// Panics if `out.len()` differs from the model dimension or an id is out of range.
++    pub fn add_input_rows(&self, ids: &[i32], out: &mut [f32]) {
++        if let Some(ref qi) = self.quant_input {
++            let mut v = Vector::new(out.len());
++            v.data_mut().copy_from_slice(out);
++            for &id in ids {
++                qi.add_row_to_vector(&mut v, id, 1.0);
++            }
++            out.copy_from_slice(v.data());
++        } else {
++            for &id in ids {
++                for (o, &x) in out.iter_mut().zip(self.input.row(id as i64)) {
++                    *o += x;
++                }
++            }
++        }
++    }
++
+     /// Return the word vector for a given word.
+     ///
+     /// For in-vocabulary words the vector is the average of all stored subword
+diff --git a/src/fasttext/predict.rs b/src/fasttext/predict.rs
+--- a/src/fasttext/predict.rs
++++ b/src/fasttext/predict.rs
+@@ -74,6 +74,31 @@
+         self.predict_words_internal(word_ids, k, effective_threshold)
+     }
+ 
++    /// Like [`Self::predict_on_words`] but returns raw
++    /// `(log_prob, label_index)` pairs (sorted by decreasing probability) without
++    /// allocating label strings. `prob = log_prob.exp()`, as in the C++ Python binding.
++    pub fn predict_on_words_raw(
++        &self,
++        word_ids: &[i32],
++        k: usize,
++        threshold: f32,
++    ) -> Vec<(f32, i32)> {
++        let nlabels = self.dict.nlabels() as usize;
++        if k == 0 || word_ids.is_empty() || nlabels == 0 {
++            return Vec::new();
++        }
++        let mut state = State::new(self.args.dim as usize, nlabels, 0);
++        let k_eff = k.min(nlabels) as i32;
++        // The threshold is passed through unclamped, like C++: a negative value filters
++        // nothing in `findKBest`, and `std_log(threshold)` becomes NaN (threshold < -1e-5)
++        // which disables the hierarchical-softmax DFS pruning, so `k = -1` returns all labels.
++        if self.quant {
++            self.predict_raw_quantized(word_ids, k_eff, threshold, &mut state)
++        } else {
++            self.model.predict(word_ids, k_eff, threshold, &mut state)
++        }
++    }
++
+     /// Internal helper: run model.predict on pre-validated word IDs.
+     fn predict_words_internal(
+         &self,
+-- 
+2.43.0
+

@@ -1,0 +1,9 @@
+0001-fix-quantized-hs-ns-predict.patch
+0002-bit-exact-scores.patch
+0003-raw-predict-and-input-rows.patch
+0004-faster-subword-hashing.patch
+0005-training-os-threads-and-progress.patch
+0006-parallel-matrix-init.patch
+0007-pretrained-vectors-join-dictionary.patch
+0008-quantize-args-and-memory.patch
+0009-dictionary-non-utf8-words.patch

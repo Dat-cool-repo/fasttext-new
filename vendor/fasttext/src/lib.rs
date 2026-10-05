@@ -1,0 +1,17 @@
+pub mod args;
+pub mod autotune;
+pub mod dictionary;
+pub mod error;
+pub mod fasttext;
+pub(crate) mod loss;
+pub mod matrix;
+pub mod meter;
+pub(crate) mod model;
+pub(crate) mod product_quantizer;
+pub(crate) mod quant_matrix;
+pub(crate) mod simd;
+pub(crate) mod utils;
+pub(crate) mod vector;
+
+pub use error::{FastTextError, Result};
+pub use fasttext::{FastText, Prediction, TrainingHandle};

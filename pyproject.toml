@@ -1,0 +1,43 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+# PyPI distribution `fasttext-new`, import name `fasttext_new`.
+# (`fasttext-rs` / `fasttext_rs` belong to an unrelated project.) `import fasttext` keeps
+# working after `fasttext_new.install_as_fasttext()`.
+name = "fasttext-new"
+version = "0.1.0"
+description = "Drop-in replacement for the archived `fasttext` Python package, backed by pure Rust (PyO3)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE", "vendor/fasttext/LICENSE"]
+authors = [{ name = "Dat-cool-repo" }]
+keywords = ["fasttext", "language-identification", "text-classification", "word-vectors"]
+dependencies = ["numpy>=1.21"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
+    "Topic :: Text Processing :: Linguistic",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/Dat-cool-repo/fasttext-new"
+Repository = "https://github.com/Dat-cool-repo/fasttext-new"
+Issues = "https://github.com/Dat-cool-repo/fasttext-new/issues"
+
+[project.optional-dependencies]
+test = ["pytest", "fasttext-numpy2"]
+
+[tool.maturin]
+features = ["python"]
+python-source = "python"
+module-name = "fasttext_new._fasttext_new"
+exclude = ["**/__pycache__/**", "**/*.pyc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

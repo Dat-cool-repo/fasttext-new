@@ -1,0 +1,15 @@
+lid.176.ftz.json records the outputs of Facebook's pre-trained language-identification model
+lid.176.ftz (https://fasttext.cc/docs/en/language-identification.html) on the sentences in
+tests/data/sentences.txt and tests/golden_texts.py, as computed by the C++ fastText package:
+predicted labels and probabilities, the model's label list, a sample of 50 dictionary words, and
+a few word and sentence vectors.
+
+The lid.176 models are published by Facebook under the Creative Commons Attribution-Share-Alike
+License 3.0 (https://creativecommons.org/licenses/by-sa/3.0/). This file is derived from that
+model and is distributed under the same license, not under the MIT / Apache-2.0 license of the
+rest of this repository. The model itself is not included in this repository; scripts/setup_env.sh
+downloads it.
+
+Reference: A. Joulin, E. Grave, P. Bojanowski, T. Mikolov, "Bag of Tricks for Efficient Text
+Classification" (2016); A. Joulin, E. Grave, P. Bojanowski, M. Douze, H. Jegou, T. Mikolov,
+"FastText.zip: Compressing text classification models" (2016).

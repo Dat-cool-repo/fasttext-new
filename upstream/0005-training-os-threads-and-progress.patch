@@ -1,0 +1,344 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dat-cool-repo <Dat-cool-repo@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 00:00:00 +0000
+Subject: [PATCH 5/9] Train on dedicated OS threads and print C++-style progress (verbose)
+
+* The Hogwild! workers were tasks on rayon's global pool. With fewer pool threads than
+  `args.thread` (e.g. `RAYON_NUM_THREADS=4`, `thread=12`, or training started from inside a
+  rayon task) they ran one after another. The later ones found the token budget exhausted,
+  which changes the learning-rate schedule and the data partitioning. Like C++ `startThreads`,
+  every worker now gets its own scoped OS thread. The same applies to the retraining in
+  `quantize`, which also honours `verbose` now.
+* `verbose` was ignored. Like C++, `verbose > 0` prints the dictionary summary ("Read NM words /
+  Number of words / Number of labels") and a final progress line. `verbose > 1` also prints a
+  `Progress: ... words/sec/thread ... lr ... avg.loss ... ETA` line every 100 ms from a monitor
+  loop, using thread 0's running loss as C++ does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QeswAUonCzqFJEnwyzk7PA
+---
+
+diff --git a/src/fasttext/mod.rs b/src/fasttext/mod.rs
+--- a/src/fasttext/mod.rs
++++ b/src/fasttext/mod.rs
+@@ -120,6 +120,9 @@
+     /// When `Some`, records the average loss after each completed epoch.
+     /// Best used with `thread=1` for accurate epoch boundaries.
+     pub(super) epoch_loss_tracker: Option<Arc<Mutex<Vec<f32>>>>,
++    /// Thread 0's running average loss (f32 bits, `-1` until
++    /// the first update), reported by the C++-style progress output when `verbose > 1`.
++    pub(super) progress_loss: &'a std::sync::atomic::AtomicU32,
+ }
+ 
+ /// Result of loading input and output matrices from binary format.
+diff --git a/src/fasttext/quantize.rs b/src/fasttext/quantize.rs
+--- a/src/fasttext/quantize.rs
++++ b/src/fasttext/quantize.rs
+@@ -1,8 +1,6 @@
+-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
++use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
+ use std::sync::Arc;
+ 
+-use rayon::prelude::*;
+-
+ use crate::args::{Args, ModelName};
+ use crate::dictionary::{EntryType, EOS};
+ use crate::error::{FastTextError, Result};
+@@ -175,6 +173,7 @@
+         retrain_args.epoch = qargs.epoch;
+         retrain_args.lr = qargs.lr;
+         retrain_args.thread = qargs.thread;
++        retrain_args.verbose = qargs.verbose; // like C++
+ 
+         let n_threads = (retrain_args.thread as usize).max(1);
+         let output_size = self.output.rows() as usize;
+@@ -186,34 +185,59 @@
+         let shared_loss = Arc::new(AtomicU64::new(f64::to_bits(0.0)));
+         let shared_loss_count = Arc::new(AtomicI64::new(0));
+         let abort_flag = Arc::new(AtomicBool::new(false));
++        let progress_loss = AtomicU32::new((-1.0f32).to_bits());
++        let start = std::time::Instant::now();
+ 
+-        let training_results: Vec<Result<()>> = (0..n_threads)
+-            .into_par_iter()
+-            .map(|thread_id| {
+-                let loss = build_loss(
+-                    &retrain_args,
+-                    Arc::clone(&output),
+-                    &target_counts,
+-                    Arc::clone(&self.loss_tables),
+-                );
+-                let model = Model::new(Arc::clone(&pruned_input), loss, normalize_gradient);
+-                let ctx = TrainThreadCtx {
+-                    args: &retrain_args,
+-                    dict: &self.dict,
+-                    model: &model,
+-                    output_size,
+-                    token_count: &token_count,
+-                    abort_flag: &abort_flag,
+-                    shared_loss: &shared_loss,
+-                    epoch_loss_tracker: None,
+-                };
+-                Self::train_thread_inner(thread_id, n_threads, &ctx, &shared_loss_count)
+-            })
+-            .collect();
++        // Dedicated OS threads (see `run_hogwild_training`).
++        let training_results: Vec<Result<()>> = std::thread::scope(|s| {
++            let handles: Vec<_> = (0..n_threads)
++                .map(|thread_id| {
++                    let (retrain_args, output, target_counts, pruned_input) =
++                        (&retrain_args, &output, &target_counts, &pruned_input);
++                    let (token_count, abort_flag, shared_loss, shared_loss_count) =
++                        (&token_count, &abort_flag, &shared_loss, &shared_loss_count);
++                    let progress_loss = &progress_loss;
++                    s.spawn(move || {
++                        let loss = build_loss(
++                            retrain_args,
++                            Arc::clone(output),
++                            target_counts,
++                            Arc::clone(&self.loss_tables),
++                        );
++                        let model = Model::new(Arc::clone(pruned_input), loss, normalize_gradient);
++                        let ctx = TrainThreadCtx {
++                            args: retrain_args,
++                            dict: &self.dict,
++                            model: &model,
++                            output_size,
++                            token_count,
++                            abort_flag,
++                            shared_loss,
++                            epoch_loss_tracker: None,
++                            progress_loss,
++                        };
++                        Self::train_thread_inner(thread_id, n_threads, &ctx, shared_loss_count)
++                    })
++                })
++                .collect();
++            Self::wait_with_progress(
++                &retrain_args,
++                self.dict.ntokens(),
++                &handles,
++                &token_count,
++                &progress_loss,
++                start,
++            );
++            handles
++                .into_iter()
++                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
++                .collect()
++        });
+ 
+         for r in training_results {
+             r?;
+         }
++        Self::print_final_progress(&retrain_args, &token_count, &progress_loss, start);
+ 
+         Ok(())
+     }
+diff --git a/src/fasttext/train.rs b/src/fasttext/train.rs
+--- a/src/fasttext/train.rs
++++ b/src/fasttext/train.rs
+@@ -1,9 +1,8 @@
+ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+ use std::path::Path;
+-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex};
+-
+-use rayon::prelude::*;
++use std::time::{Duration, Instant};
+ 
+ use crate::args::{Args, LossName, ModelName};
+ use crate::dictionary::{Dictionary, EntryType};
+@@ -70,7 +69,7 @@
+     /// Steps:
+     /// 1. Read input file and build vocabulary.
+     /// 2. Initialize matrices.
+-    /// 3. Run training in parallel using rayon (Hogwild! SGD).
++    /// 3. Run training in parallel on `args.thread` OS threads (Hogwild! SGD).
+     /// 4. Return a trained `FastText` instance.
+     pub fn train_with_abort(args: Args, abort_flag: Arc<AtomicBool>) -> Result<Self> {
+         Self::train_internal(args, abort_flag, None)
+@@ -187,38 +186,129 @@
+         let token_count = AtomicI64::new(0);
+         let shared_loss = AtomicU64::new(f64::to_bits(0.0));
+         let shared_loss_count = AtomicI64::new(0);
++        let progress_loss = AtomicU32::new((-1.0f32).to_bits());
++        let start = Instant::now();
+ 
+-        let training_results: Vec<Result<()>> = (0..n_threads)
+-            .into_par_iter()
+-            .map(|thread_id| {
+-                let loss = build_loss(
+-                    args,
+-                    Arc::clone(output),
+-                    &target_counts,
+-                    Arc::clone(loss_tables),
+-                );
+-                let model = Model::new(Arc::clone(input), loss, normalize_gradient);
+-                let ctx = TrainThreadCtx {
+-                    args,
+-                    dict,
+-                    model: &model,
+-                    output_size,
+-                    token_count: &token_count,
+-                    abort_flag,
+-                    shared_loss: &shared_loss,
+-                    epoch_loss_tracker: epoch_loss_tracker.clone(),
+-                };
+-                Self::train_thread_inner(thread_id, n_threads, &ctx, &shared_loss_count)
+-            })
+-            .collect();
++        // One dedicated OS thread per `args.thread`, like C++
++        // `startThreads`. Running the workers as tasks on rayon's global pool serialised them
++        // whenever the pool had fewer threads than `args.thread` (e.g. RAYON_NUM_THREADS=4,
++        // thread=12), which changes the lr schedule and data partitioning C++ relies on.
++        let training_results: Vec<Result<()>> = std::thread::scope(|s| {
++            let handles: Vec<_> = (0..n_threads)
++                .map(|thread_id| {
++                    let (token_count, shared_loss, shared_loss_count, progress_loss) = (
++                        &token_count,
++                        &shared_loss,
++                        &shared_loss_count,
++                        &progress_loss,
++                    );
++                    let tracker = epoch_loss_tracker.clone();
++                    let target_counts = &target_counts;
++                    s.spawn(move || {
++                        let loss = build_loss(
++                            args,
++                            Arc::clone(output),
++                            target_counts,
++                            Arc::clone(loss_tables),
++                        );
++                        let model = Model::new(Arc::clone(input), loss, normalize_gradient);
++                        let ctx = TrainThreadCtx {
++                            args,
++                            dict,
++                            model: &model,
++                            output_size,
++                            token_count,
++                            abort_flag,
++                            shared_loss,
++                            epoch_loss_tracker: tracker,
++                            progress_loss,
++                        };
++                        Self::train_thread_inner(thread_id, n_threads, &ctx, shared_loss_count)
++                    })
++                })
++                .collect();
++            Self::wait_with_progress(
++                args,
++                dict.ntokens(),
++                &handles,
++                &token_count,
++                &progress_loss,
++                start,
++            );
++            handles
++                .into_iter()
++                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
++                .collect()
++        });
+ 
+         for result in training_results {
+             result?;
+         }
++        Self::print_final_progress(args, &token_count, &progress_loss, start);
+ 
+         Ok(Self::compute_avg_loss(&shared_loss, &shared_loss_count))
+     }
+ 
++    /// C++ `startThreads` progress loop: with `verbose > 1`,
++    /// print a `Progress:` line to stderr every 100 ms until all workers have finished.
++    pub(super) fn wait_with_progress<T>(
++        args: &Args,
++        ntokens: i64,
++        handles: &[std::thread::ScopedJoinHandle<'_, T>],
++        token_count: &AtomicI64,
++        progress_loss: &AtomicU32,
++        start: Instant,
++    ) {
++        if args.verbose <= 1 {
++            return;
++        }
++        while !handles.iter().all(|h| h.is_finished()) {
++            std::thread::sleep(Duration::from_millis(100));
++            let loss = f32::from_bits(progress_loss.load(Ordering::Relaxed));
++            if loss >= 0.0 {
++                let tc = token_count.load(Ordering::Relaxed);
++                let progress = tc as f64 / (args.epoch as f64 * ntokens as f64);
++                eprint!("\r{}", Self::progress_info(args, progress, loss, tc, start));
++            }
++        }
++    }
++
++    /// Final C++ progress line (`verbose > 0`).
++    pub(super) fn print_final_progress(
++        args: &Args,
++        token_count: &AtomicI64,
++        progress_loss: &AtomicU32,
++        start: Instant,
++    ) {
++        if args.verbose > 0 {
++            let loss = f32::from_bits(progress_loss.load(Ordering::Relaxed));
++            let tc = token_count.load(Ordering::Relaxed);
++            eprintln!("\r{}", Self::progress_info(args, 1.0, loss, tc, start));
++        }
++    }
++
++    /// C++ `FastText::printInfo`.
++    fn progress_info(args: &Args, progress: f64, loss: f32, tc: i64, start: Instant) -> String {
++        let t = start.elapsed().as_secs_f64();
++        let lr = args.lr * (1.0 - progress);
++        let (mut pct, mut wst, mut eta) = (progress, 0.0f64, 2_592_000i64);
++        if progress > 0.0 && t >= 0.0 {
++            pct = progress * 100.0;
++            eta = (t * (100.0 - pct) / pct) as i64;
++            wst = tc as f64 / t / args.thread.max(1) as f64;
++        }
++        format!(
++            "Progress: {:5.1}% words/sec/thread: {:7} lr: {:9.6} avg.loss: {:9.6} ETA: {:3}h{:2}m{:2}s",
++            pct,
++            wst as i64,
++            lr,
++            loss,
++            eta / 3600,
++            (eta % 3600) / 60,
++            eta % 60
++        )
++    }
++
+     /// Internal training implementation with optional epoch loss tracking.
+     fn train_internal(
+         args: Args,
+@@ -233,6 +323,15 @@
+ 
+         let args_arc = Arc::new(args.clone());
+         let dict = Self::build_vocabulary(&args, &args_arc)?;
++        if args.verbose > 0 {
++            // C++ `Dictionary::readFromFile` summary.
++            eprintln!(
++                "\rRead {}M words\nNumber of words:  {}\nNumber of labels: {}",
++                dict.ntokens() / 1_000_000,
++                dict.nwords(),
++                dict.nlabels()
++            );
++        }
+         let (input, output) = Self::initialize_matrices(&args, &dict)?;
+         let loss_tables = Arc::new(LossTables::new());
+ 
+@@ -616,6 +715,10 @@
+                 ctx.token_count
+                     .fetch_add(local_token_count, Ordering::Relaxed);
+                 local_token_count = 0;
++                if thread_id == 0 && ctx.args.verbose > 1 {
++                    ctx.progress_loss
++                        .store(state.get_loss().to_bits(), Ordering::Relaxed);
++                }
+             }
+         }
+ 
+-- 
+2.43.0
+

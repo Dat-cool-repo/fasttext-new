@@ -1,0 +1,295 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dat-cool-repo <Dat-cool-repo@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 00:00:00 +0000
+Subject: [PATCH 2/9] Make prediction scores bit-identical to C++ fastText
+
+Several small numeric differences made probabilities differ from C++ in the last bits. They also
+changed the order of tied predictions, which is common with the table-based sigmoid of OVA / NS
+models:
+
+* `std_log` is computed in f64 like C++ (`std::log(x + 1e-5)` with a double literal).
+* top-k selection (`find_k_best`) and the HS DFS use a port of libstdc++'s
+  `push_heap` / `pop_heap` / `sort_heap` with C++'s comparator, so ties come out in the same
+  order as C++.
+* The exact HS sigmoid divides in double (`1. / (1 + std::exp(-f))`).
+* softmax divides by `z` (C++ `output[i] /= z`) instead of multiplying by `1/z`.
+* The output-layer dot product accumulates sequentially like C++ `DenseMatrix::dotRow`. The
+  SIMD/FMA version is kept behind a new `simd-dot` feature. The hidden-layer average dominates
+  inference time, so the cost is small.
+
+With these changes `lid.176.bin` / `lid.176.ftz` predictions (labels, order and
+probabilities) are identical to the C++ package (max |dp| = 0) on 10,121 lines.
+
+Open question for the maintainers: whether exact parity or the SIMD dot product should be the
+default (this patch makes parity the default).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QeswAUonCzqFJEnwyzk7PA
+---
+
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,6 +16,9 @@
+ 
+ [features]
+ cli = ["clap"]
++# Use the SIMD/FMA output-layer dot product (faster for large `dim`, but not
++# bit-identical to C++ fastText).
++simd-dot = []
+ 
+ [dev-dependencies]
+ criterion = { version = "0.8", features = ["html_reports"] }
+diff --git a/src/loss.rs b/src/loss.rs
+--- a/src/loss.rs
++++ b/src/loss.rs
+@@ -19,7 +19,7 @@
+ 
+ use crate::matrix::{DenseMatrix, Matrix};
+ use crate::model::{MinstdRng, Predictions, State};
+-use crate::utils::{self, OrdF32};
++use crate::utils;
+ use crate::vector::Vector;
+ 
+ // Constants
+@@ -41,9 +41,92 @@
+ /// The small addend prevents log(0) = -∞.  C++ uses `1e-5` (double literal)
+ /// but the result is truncated to `real` (float); using `1e-5_f32` here
+ /// produces the same output since the difference is below f32 epsilon.
++///
++/// Computed in `f64` exactly like C++
++/// (`std::log(x + 1e-5)` with a double literal, then narrowed), so that scores, ties and
++/// threshold comparisons are bit-identical to C++ fastText.
+ #[inline]
+ pub fn std_log(x: f32) -> f32 {
+-    (x + 1e-5_f32).ln()
++    ((x as f64) + 1e-5).ln() as f32
++}
++
++// libstdc++-compatible binary heap.
++//
++// C++ fastText keeps its top-k candidates in a `std::vector` managed with
++// `std::push_heap` / `std::pop_heap` / `std::sort_heap` and the comparator
++// `l.first > r.first`. Re-implementing the exact libstdc++ algorithms makes the
++// order of *tied* predictions (common with the table-based sigmoid of OVA / NS
++// losses) identical to the C++ package.
++
++#[inline]
++fn heap_cmp(l: &(f32, i32), r: &(f32, i32)) -> bool {
++    l.0 > r.0
++}
++
++/// libstdc++ `__push_heap`.
++fn heap_sift_up(h: &mut [(f32, i32)], mut hole: usize, top: usize, value: (f32, i32)) {
++    while hole > top {
++        let parent = (hole - 1) / 2;
++        if !heap_cmp(&h[parent], &value) {
++            break;
++        }
++        h[hole] = h[parent];
++        hole = parent;
++    }
++    h[hole] = value;
++}
++
++/// libstdc++ `__adjust_heap` (`len >= 1`).
++fn heap_adjust(h: &mut [(f32, i32)], mut hole: usize, len: usize, value: (f32, i32)) {
++    let top = hole;
++    let mut second = hole;
++    while second < (len - 1) / 2 {
++        second = 2 * (second + 1);
++        if heap_cmp(&h[second], &h[second - 1]) {
++            second -= 1;
++        }
++        h[hole] = h[second];
++        hole = second;
++    }
++    if len & 1 == 0 && second == (len - 2) / 2 {
++        second = 2 * (second + 1);
++        h[hole] = h[second - 1];
++        hole = second - 1;
++    }
++    heap_sift_up(h, hole, top, value);
++}
++
++/// libstdc++ `__pop_heap(first, first + last, first + last)`.
++fn heap_pop_to(h: &mut [(f32, i32)], last: usize) {
++    let value = h[last];
++    h[last] = h[0];
++    heap_adjust(h, 0, last, value);
++}
++
++/// `std::push_heap` on the whole vector (new element already pushed at the back).
++pub(crate) fn cpp_push_heap(h: &mut [(f32, i32)]) {
++    let n = h.len();
++    if n > 1 {
++        let v = h[n - 1];
++        heap_sift_up(h, n - 1, 0, v);
++    }
++}
++
++/// `std::pop_heap` (moves the front to the back; caller pops it).
++pub(crate) fn cpp_pop_heap(h: &mut [(f32, i32)]) {
++    let n = h.len();
++    if n > 1 {
++        heap_pop_to(h, n - 1);
++    }
++}
++
++/// `std::sort_heap`: result is sorted by descending score.
++pub(crate) fn cpp_sort_heap(h: &mut [(f32, i32)]) {
++    let mut last = h.len();
++    while last > 1 {
++        last -= 1;
++        heap_pop_to(h, last);
++    }
+ }
+ 
+ // Precomputed tables
+@@ -173,35 +256,24 @@
+     if k == 0 {
+         return;
+     }
+-    use std::cmp::Reverse;
+-    use std::collections::BinaryHeap;
+-
+-    // Min-heap keyed on raw probability (smallest at top) via Reverse.
+-    // Since std_log is monotonically increasing, ordering by raw score
+-    // gives the same top-k as ordering by log-score. We only compute
+-    // std_log for the final k survivors, avoiding ln() on all other labels.
+-    let mut min_heap: BinaryHeap<Reverse<(OrdF32, i32)>> = BinaryHeap::with_capacity(k + 1);
+-
+-    for (i, &score) in output.data().iter().enumerate() {
+-        if score < threshold {
++    // Exact port of C++ `Loss::findKBest` +
++    // `std::sort_heap` (same comparisons, same libstdc++ heap => same tie order).
++    for (i, &p) in output.data().iter().enumerate() {
++        if p < threshold {
+             continue;
+         }
+-        if min_heap.len() == k && score < min_heap.peek().unwrap().0 .0 .0 {
++        let s = std_log(p);
++        if heap.len() == k && s < heap[0].0 {
+             continue;
+         }
+-        min_heap.push(Reverse((OrdF32(score), i as i32)));
+-        if min_heap.len() > k {
+-            min_heap.pop();
++        heap.push((s, i as i32));
++        cpp_push_heap(heap);
++        if heap.len() > k {
++            cpp_pop_heap(heap);
++            heap.pop();
+         }
+     }
+-
+-    // Convert survivors to log-probability and sort descending.
+-    heap.extend(
+-        min_heap
+-            .into_iter()
+-            .map(|Reverse((OrdF32(s), idx))| (std_log(s), idx)),
+-    );
+-    heap.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
++    cpp_sort_heap(heap);
+ }
+ 
+ // BinaryLogisticBase — shared helper for OVA, NS, HS
+@@ -567,28 +639,27 @@
+         if score < log_threshold {
+             return;
+         }
+-        if heap.len() == k && !heap.is_empty() && score < heap.last().unwrap().0 {
++        // libstdc++ heap, exactly like C++ `dfs`.
++        if heap.len() == k && !heap.is_empty() && score < heap[0].0 {
+             return;
+         }
+ 
+         let n = &self.tree[node];
+         if n.left == -1 && n.right == -1 {
+-            // Leaf node: insert into heap maintaining descending sort order
+-            let pos = heap
+-                .iter()
+-                .position(|&(s, _)| s < score)
+-                .unwrap_or(heap.len());
+-            heap.insert(pos, (score, node as i32));
++            heap.push((score, node as i32));
++            cpp_push_heap(heap);
+             if heap.len() > k {
+-                heap.pop(); // Remove the minimum (last element)
++                cpp_pop_heap(heap);
++                heap.pop();
+             }
+             return;
+         }
+ 
+         // Internal node: exact sigmoid of wo[node - osz] · hidden
++        // (C++: `f = 1. / (1 + std::exp(-f))`, i.e. the division happens in double).
+         let matrix_row = node as i32 - self.osz;
+         let f_raw = self.base.wo.dot_row(hidden, matrix_row as i64);
+-        let f = 1.0_f32 / (1.0 + (-f_raw).exp()); // exact sigmoid
++        let f = (1.0_f64 / (1.0_f32 + (-f_raw).exp()) as f64) as f32;
+ 
+         let left = self.tree[node].left as usize;
+         let right = self.tree[node].right as usize;
+@@ -659,8 +730,8 @@
+         let root = (2 * self.osz - 2) as usize;
+         let hidden = &state.hidden;
+         self.dfs_with_hidden(k as usize, threshold, root, 0.0, heap, hidden);
+-        // Sort descending (highest log-prob first)
+-        heap.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
++        // C++ `std::sort_heap` (descending, same tie order).
++        cpp_sort_heap(heap);
+     }
+ }
+ 
+diff --git a/src/simd/mod.rs b/src/simd/mod.rs
+--- a/src/simd/mod.rs
++++ b/src/simd/mod.rs
+@@ -1,3 +1,4 @@
++#![cfg_attr(not(feature = "simd-dot"), allow(dead_code))]
+ // Shared SIMD kernels for dot product, vector addition, and row averaging.
+ //
+ // Organized by target feature level:
+@@ -62,6 +63,24 @@
+ /// Dispatch dot product to best available implementation.
+ #[inline]
+ pub(crate) fn dot_impl(a: &[f32], b: &[f32]) -> f32 {
++    // Sequential scalar accumulation, exactly like C++
++    // `DenseMatrix::dotRow` (`d += at(i, j) * vec[j]`). The SIMD/FMA variants below reorder
++    // and fuse the additions, which changes results in the last bits and can flip the order
++    // of near-tied predictions relative to the C++ package. Output dot products are a small
++    // share of inference time (hidden-layer averaging dominates).
++    #[cfg(not(feature = "simd-dot"))]
++    {
++        dot_scalar(a, b)
++    }
++    #[cfg(feature = "simd-dot")]
++    {
++        dot_impl_simd(a, b)
++    }
++}
++
++#[cfg(feature = "simd-dot")]
++#[inline]
++fn dot_impl_simd(a: &[f32], b: &[f32]) -> f32 {
+     #[cfg(target_arch = "aarch64")]
+     {
+         neon::dot(a, b)
+diff --git a/src/utils.rs b/src/utils.rs
+--- a/src/utils.rs
++++ b/src/utils.rs
+@@ -100,9 +100,9 @@
+         z += *v;
+     }
+     if z > 0.0 {
+-        let inv_z = 1.0 / z;
++        // divide (C++ `output[i] /= z`), not multiply by 1/z.
+         for v in data.iter_mut() {
+-            *v *= inv_z;
++            *v /= z;
+         }
+     }
+ }
+-- 
+2.43.0
+

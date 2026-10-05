@@ -1,0 +1,39 @@
+# Rust / maturin build output
+/target/
+target/
+/dist/
+dist/
+*.whl
+*.so
+*.pyd
+*.dll
+*.dylib
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.venv*/
+venv/
+env/
+.env
+
+# Models, corpora and downloaded data (fetched by scripts/setup_env.sh, never committed)
+/data/
+*.bin
+*.ftz
+*.vec
+*.csv
+tests/data/*.txt
+!tests/data/sentences.txt
+
+# Benchmarks and editor files
+bench/results*.json
+.idea/
+.vscode/
+*.swp
+.DS_Store

@@ -1,0 +1,1248 @@
+diff -ru a/src/dictionary.rs b/src/dictionary.rs
+--- a/src/dictionary.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/dictionary.rs	2026-10-04 23:53:25.570698900 -0400
+@@ -1,6 +1,32 @@
+ // Dictionary: tokenization, vocabulary, subwords, word n-grams, hash table
+ 
+ use std::collections::HashMap;
++
++/// [fasttext-python-bindings patch] Cheap multiplicative hasher for the `i32` keys of
++/// `pruneidx` (looked up once per character n-gram of every OOV token in `.ftz` models;
++/// SipHash made tokenization ~2x slower than C++'s `std::unordered_map`).
++#[derive(Default, Clone, Copy)]
++pub struct IntHasher(u64);
++
++impl std::hash::Hasher for IntHasher {
++    #[inline]
++    fn finish(&self) -> u64 {
++        self.0
++    }
++    #[inline]
++    fn write(&mut self, bytes: &[u8]) {
++        for &b in bytes {
++            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
++        }
++    }
++    #[inline]
++    fn write_i32(&mut self, i: i32) {
++        self.0 = (i as u32 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
++    }
++}
++
++/// Pruned n-gram bucket -> compact row map.
++pub type PruneIdx = HashMap<i32, i32, std::hash::BuildHasherDefault<IntHasher>>;
+ use std::io::{Read, Write};
+ use std::sync::Arc;
+ 
+@@ -50,8 +76,13 @@
+ /// A vocabulary entry.
+ #[derive(Debug, Clone)]
+ pub struct Entry {
+-    /// The word string.
++    /// The word string. When the word is not valid UTF-8 (possible in models trained by C++
++    /// fastText on raw web text), this is a lossy copy and the exact bytes are in `raw`.
+     pub word: String,
++    /// [fasttext-python-bindings patch] The exact bytes of `word` when they are not valid
++    /// UTF-8 (`None` otherwise). Hashing, lookups, subwords and saving use these bytes, so
++    /// such models load, behave and round-trip like in C++.
++    pub raw: Option<Box<[u8]>>,
+     /// Occurrence count.
+     pub count: i64,
+     /// Entry type (word or label).
+@@ -60,6 +91,17 @@
+     pub subwords: Vec<i32>,
+ }
+ 
++impl Entry {
++    /// The exact bytes of the word (see [`Entry::raw`]).
++    #[inline]
++    pub fn bytes(&self) -> &[u8] {
++        match &self.raw {
++            Some(b) => b,
++            None => self.word.as_bytes(),
++        }
++    }
++}
++
+ /// Dictionary holding vocabulary, tokenization logic, and open-addressing hash table.
+ ///
+ /// The hash table (word2int) maps from FNV-1a hash position to word index in `words`.
+@@ -85,7 +127,7 @@
+     /// Prune index size (`PRUNEIDX_NONE` = no pruning, 0+ = pruned).
+     pruneidx_size: i64,
+     /// Prune index mapping (for quantization).
+-    pruneidx: HashMap<i32, i32>,
++    pruneidx: PruneIdx,
+ }
+ 
+ impl Dictionary {
+@@ -109,7 +151,7 @@
+             nlabels: 0,
+             ntokens: 0,
+             pruneidx_size: PRUNEIDX_NONE,
+-            pruneidx: HashMap::new(),
++            pruneidx: PruneIdx::default(),
+             args,
+         }
+     }
+@@ -127,9 +169,15 @@
+     /// - `word2int[slot] == HASH_EMPTY` (empty slot, word not in table), or
+     /// - `words[word2int[slot]].word == w` (found the word).
+     pub fn find_slot_with_hash(&self, w: &str, h: u32) -> usize {
++        self.find_slot_bytes(w.as_bytes(), h)
++    }
++
++    /// [fasttext-python-bindings patch] Byte-wise probe (entries may hold non-UTF-8 bytes).
++    fn find_slot_bytes(&self, w: &[u8], h: u32) -> usize {
+         let len = self.word2int.len();
+         let mut id = (h as usize) % len;
+-        while self.word2int[id] != HASH_EMPTY && self.words[self.word2int[id] as usize].word != w {
++        while self.word2int[id] != HASH_EMPTY && self.words[self.word2int[id] as usize].bytes() != w
++        {
+             id = (id + 1) % len;
+         }
+         id
+@@ -147,6 +195,7 @@
+             let entry_type = self.get_type_from_str(w);
+             let entry = Entry {
+                 word: w.to_string(),
++                raw: None,
+                 count: 1,
+                 entry_type,
+                 subwords: Vec::new(),
+@@ -277,7 +326,7 @@
+             // Inline hash-table probing to avoid the `&self` borrow from `find_slot`.
+             // Since `word2int` was just cleared to all HASH_EMPTY, we only need to probe
+             // until we find an empty slot (no word comparisons needed).
+-            let word_hash = hash(self.words[i].word.as_bytes());
++            let word_hash = hash(self.words[i].bytes());
+             let len = self.word2int.len();
+             let mut slot = (word_hash as usize) % len;
+             while self.word2int[slot] != HASH_EMPTY {
+@@ -535,7 +584,7 @@
+     /// This is the core n-gram iteration used by both `compute_subwords` (which
+     /// collects hash IDs) and `compute_subwords_with_strings` (which also records
+     /// the n-gram string).
+-    fn for_each_ngram<F>(&self, word: &str, mut f: F)
++    fn for_each_ngram<F>(&self, bytes: &[u8], mut f: F)
+     where
+         F: FnMut(&[u8], i32),
+     {
+@@ -547,7 +596,6 @@
+             return;
+         }
+ 
+-        let bytes = word.as_bytes();
+         let n_bytes = bytes.len();
+         let mut i = 0usize;
+ 
+@@ -557,21 +605,24 @@
+                 continue;
+             }
+ 
+-            let mut ngram: Vec<u8> = Vec::new();
++            // [fasttext-python-bindings patch] The n-gram starting at `i` only grows, so
++            // its FNV-1a hash is updated incrementally (same value as `utils::hash`) and
++            // the bytes are borrowed from `word` instead of copied into a fresh Vec.
++            let mut fnv: u32 = 2_166_136_261;
+             let mut j = i;
+             let mut n: i32 = 1;
+ 
+             while j < n_bytes && n <= maxn {
+-                ngram.push(bytes[j]);
++                fnv = (fnv ^ bytes[j] as i8 as i32 as u32).wrapping_mul(16_777_619);
+                 j += 1;
+                 while j < n_bytes && (bytes[j] & 0xC0) == 0x80 {
+-                    ngram.push(bytes[j]);
++                    fnv = (fnv ^ bytes[j] as i8 as i32 as u32).wrapping_mul(16_777_619);
+                     j += 1;
+                 }
+ 
+                 if n >= minn && !(n == 1 && (i == 0 || j == n_bytes)) {
+-                    let h = (crate::utils::hash(&ngram) % bucket as u32) as i32;
+-                    f(&ngram, h);
++                    let h = (fnv % bucket as u32) as i32;
++                    f(&bytes[i..j], h);
+                 }
+ 
+                 n += 1;
+@@ -586,6 +637,11 @@
+     /// Each n-gram is hashed and mapped through `push_hash` to produce subword IDs.
+     /// No-op if `maxn == 0` or `bucket == 0`.
+     pub fn compute_subwords(&self, word: &str, ngrams: &mut Vec<i32>) {
++        self.compute_subwords_bytes(word.as_bytes(), ngrams);
++    }
++
++    /// [fasttext-python-bindings patch] [`Self::compute_subwords`] on raw bytes.
++    pub fn compute_subwords_bytes(&self, word: &[u8], ngrams: &mut Vec<i32>) {
+         self.for_each_ngram(word, |_ngram_bytes, h| {
+             self.push_hash(ngrams, h);
+         });
+@@ -602,10 +658,13 @@
+     pub fn init_ngrams(&mut self) {
+         // Collect BOW+word+EOW strings ahead of time to avoid borrow conflicts.
+         let size = self.size as usize;
+-        let words_with_markers: Vec<Option<String>> = (0..size)
++        let words_with_markers: Vec<Option<Vec<u8>>> = (0..size)
+             .map(|i| {
+                 if self.words[i].word != EOS {
+-                    Some(format!("{}{}{}", BOW, &self.words[i].word, EOW))
++                    let mut b = BOW.as_bytes().to_vec();
++                    b.extend_from_slice(self.words[i].bytes());
++                    b.extend_from_slice(EOW.as_bytes());
++                    Some(b)
+                 } else {
+                     None
+                 }
+@@ -615,7 +674,7 @@
+         for (i, maybe_marked) in words_with_markers.into_iter().enumerate() {
+             let mut subwords = vec![i as i32];
+             if let Some(ref word_with_markers) = maybe_marked {
+-                self.compute_subwords(word_with_markers, &mut subwords);
++                self.compute_subwords_bytes(word_with_markers, &mut subwords);
+             }
+             self.words[i].subwords = subwords;
+         }
+@@ -733,7 +792,7 @@
+     /// n-gram string alongside its ID. Only adds an entry when the n-gram's
+     /// bucket ID is valid (not pruned).
+     fn compute_subwords_with_strings(&self, word: &str, result: &mut Vec<(i32, String)>) {
+-        self.for_each_ngram(word, |ngram_bytes, h| {
++        self.for_each_ngram(word.as_bytes(), |ngram_bytes, h| {
+             // Replicate push_hash logic but also capture the ngram string.
+             if self.pruneidx_size != 0 && h >= 0 {
+                 let bucket_id = if self.pruneidx_size > 0 {
+@@ -994,14 +1053,14 @@
+     }
+ 
+     /// Get the pruneidx (for binary I/O).
+-    pub fn pruneidx(&self) -> &HashMap<i32, i32> {
++    pub fn pruneidx(&self) -> &PruneIdx {
+         &self.pruneidx
+     }
+ 
+     /// Set pruneidx from loaded binary data.
+     pub fn set_pruneidx(&mut self, idx: HashMap<i32, i32>) {
+         self.pruneidx_size = idx.len() as i64;
+-        self.pruneidx = idx;
++        self.pruneidx = idx.into_iter().collect();
+     }
+ 
+     /// Set pruneidx_size directly (for binary I/O loading, including negative sentinel).
+@@ -1034,9 +1093,9 @@
+         let word2int_size = ((self.size as f64 / 0.7).ceil() as usize).max(1);
+         self.word2int = vec![HASH_EMPTY; word2int_size];
+         for i in 0..self.size as usize {
+-            let w = self.words[i].word.clone();
+-            let h = hash(w.as_bytes());
+-            let slot = self.find_slot_with_hash(&w, h);
++            let w = self.words[i].bytes().to_vec();
++            let h = hash(&w);
++            let slot = self.find_slot_bytes(&w, h);
+             self.word2int[slot] = i as i32;
+         }
+     }
+@@ -1062,7 +1121,7 @@
+ 
+         for entry in &self.words {
+             // Write null-terminated word string
+-            writer.write_all(entry.word.as_bytes())?;
++            writer.write_all(entry.bytes())?;
+             writer.write_all(&[0u8])?; // null terminator
+             utils::write_i64(writer, entry.count)?;
+             // Write entry type as i8 (1 byte)
+@@ -1094,9 +1153,18 @@
+             }
+             word_bytes.push(buf[0]);
+         }
+-        let word = String::from_utf8(word_bytes).map_err(|_| {
+-            FastTextError::InvalidModel("Invalid UTF-8 in dictionary word".to_string())
+-        })?;
++        // [fasttext-python-bindings patch] C++ words are arbitrary bytes; keep invalid UTF-8
++        // exactly (in `raw`) instead of rejecting the whole model.
++        let (word, raw) = match String::from_utf8(word_bytes) {
++            Ok(w) => (w, None),
++            Err(e) => {
++                let bytes = e.into_bytes();
++                (
++                    String::from_utf8_lossy(&bytes).into_owned(),
++                    Some(bytes.into_boxed_slice()),
++                )
++            }
++        };
+         let count = utils::read_i64(reader)?;
+         let mut type_buf = [0u8; 1];
+         reader.read_exact(&mut type_buf)?;
+@@ -1112,6 +1180,7 @@
+         };
+         Ok(Entry {
+             word,
++            raw,
+             count,
+             entry_type,
+             subwords: Vec::new(),
+@@ -1119,8 +1188,8 @@
+     }
+ 
+     /// Read pruneidx pairs from binary format.
+-    fn read_pruneidx<R: Read>(reader: &mut R, pruneidx_size: i64) -> Result<HashMap<i32, i32>> {
+-        let mut pruneidx = HashMap::new();
++    fn read_pruneidx<R: Read>(reader: &mut R, pruneidx_size: i64) -> Result<PruneIdx> {
++        let mut pruneidx = PruneIdx::default();
+         if pruneidx_size > 0 {
+             for _ in 0..pruneidx_size {
+                 let first = utils::read_i32(reader)?;
+diff -ru a/src/fasttext/mod.rs b/src/fasttext/mod.rs
+--- a/src/fasttext/mod.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/fasttext/mod.rs	2026-10-04 23:16:55.669464400 -0400
+@@ -120,6 +120,9 @@
+     /// When `Some`, records the average loss after each completed epoch.
+     /// Best used with `thread=1` for accurate epoch boundaries.
+     pub(super) epoch_loss_tracker: Option<Arc<Mutex<Vec<f32>>>>,
++    /// [fasttext-python-bindings patch] Thread 0's running average loss (f32 bits, `-1` until
++    /// the first update), reported by the C++-style progress output when `verbose > 1`.
++    pub(super) progress_loss: &'a std::sync::atomic::AtomicU32,
+ }
+ 
+ /// Result of loading input and output matrices from binary format.
+@@ -167,6 +170,10 @@
+     /// Cached sigmoid/log lookup tables for quantized prediction.
+     /// Shared with loss instances via `Arc` to avoid redundant allocations.
+     pub(super) loss_tables: Arc<LossTables>,
++    /// [fasttext-python-bindings patch] Lazily-built inference model over a dequantized copy
++    /// of `quant_output`, used for hierarchical-softmax / negative-sampling prediction when
++    /// `qout=true` (C++ runs the real loss on the quantized output matrix).
++    pub(super) qout_model: std::sync::OnceLock<Model>,
+ }
+ 
+ impl FastText {
+@@ -302,6 +309,7 @@
+             abort_flag: Arc::new(AtomicBool::new(false)),
+             last_train_loss: 0.0,
+             loss_tables,
++            qout_model: std::sync::OnceLock::new(),
+         })
+     }
+ 
+@@ -410,6 +418,28 @@
+         self.quant_output.as_ref()
+     }
+ 
++    /// [fasttext-python-bindings patch] Add the input-matrix rows `ids` to `out`
++    /// (C++ `FastText::addInputVector`), for dense and quantized models alike.
++    ///
++    /// # Panics
++    /// Panics if `out.len()` differs from the model dimension or an id is out of range.
++    pub fn add_input_rows(&self, ids: &[i32], out: &mut [f32]) {
++        if let Some(ref qi) = self.quant_input {
++            let mut v = Vector::new(out.len());
++            v.data_mut().copy_from_slice(out);
++            for &id in ids {
++                qi.add_row_to_vector(&mut v, id, 1.0);
++            }
++            out.copy_from_slice(v.data());
++        } else {
++            for &id in ids {
++                for (o, &x) in out.iter_mut().zip(self.input.row(id as i64)) {
++                    *o += x;
++                }
++            }
++        }
++    }
++
+     /// Return the word vector for a given word.
+     ///
+     /// For in-vocabulary words the vector is the average of all stored subword
+diff -ru a/src/fasttext/predict.rs b/src/fasttext/predict.rs
+--- a/src/fasttext/predict.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/fasttext/predict.rs	2026-10-04 23:14:46.610455500 -0400
+@@ -74,6 +74,31 @@
+         self.predict_words_internal(word_ids, k, effective_threshold)
+     }
+ 
++    /// [fasttext-python-bindings patch] Like [`Self::predict_on_words`] but returns raw
++    /// `(log_prob, label_index)` pairs (sorted by decreasing probability) without
++    /// allocating label strings. `prob = log_prob.exp()`, as in the C++ Python binding.
++    pub fn predict_on_words_raw(
++        &self,
++        word_ids: &[i32],
++        k: usize,
++        threshold: f32,
++    ) -> Vec<(f32, i32)> {
++        let nlabels = self.dict.nlabels() as usize;
++        if k == 0 || word_ids.is_empty() || nlabels == 0 {
++            return Vec::new();
++        }
++        let mut state = State::new(self.args.dim as usize, nlabels, 0);
++        let k_eff = k.min(nlabels) as i32;
++        // The threshold is passed through unclamped, like C++: a negative value filters
++        // nothing in `findKBest`, and `std_log(threshold)` becomes NaN (threshold < -1e-5)
++        // which disables the hierarchical-softmax DFS pruning, so `k = -1` returns all labels.
++        if self.quant {
++            self.predict_raw_quantized(word_ids, k_eff, threshold, &mut state)
++        } else {
++            self.model.predict(word_ids, k_eff, threshold, &mut state)
++        }
++    }
++
+     /// Internal helper: run model.predict on pre-validated word IDs.
+     fn predict_words_internal(
+         &self,
+@@ -139,19 +164,48 @@
+         // Compute hidden representation using quantized input matrix.
+         quant_input.average_rows_to_vector(&mut state.hidden, word_ids);
+ 
+-        // Compute raw output scores.
+-        let osz = nlabels;
+-        match &self.quant_output {
+-            Some(qout) => {
+-                for (i, out) in state.output.data_mut()[..osz].iter_mut().enumerate() {
+-                    *out = qout.dot_row(&state.hidden, i as i64);
+-                }
++        // [fasttext-python-bindings patch] The original code below always applied a softmax
++        // (or OVA sigmoid) over the first `nlabels` output rows. That is wrong for
++        // hierarchical softmax (output rows are Huffman-tree nodes, e.g. lid.176.ftz) and for
++        // negative sampling (binary logistic). Like C++ `Model::predict`, delegate to the real
++        // loss whenever the output matrix is dense, and to a loss over a dequantized output
++        // matrix for HS / NS with `qout=true`.
++        let mut heap = Predictions::new();
++        match (&self.quant_output, self.args.loss) {
++            (None, _) => {
++                self.model.loss.predict(k, threshold, &mut heap, state);
++                return heap;
+             }
+-            None => {
+-                // Use dense output matrix (qout=false).
+-                for (i, out) in state.output.data_mut()[..osz].iter_mut().enumerate() {
+-                    *out = self.output.dot_row(&state.hidden, i as i64);
+-                }
++            (Some(qout), LossName::HierarchicalSoftmax | LossName::NegativeSampling) => {
++                let model = self.qout_model.get_or_init(|| {
++                    let rows = qout.rows();
++                    let cols = qout.cols();
++                    let mut dense = crate::matrix::DenseMatrix::new(rows, cols);
++                    let mut v = crate::vector::Vector::new(cols as usize);
++                    for i in 0..rows {
++                        v.zero();
++                        qout.add_row_to_vector(&mut v, i as i32, 1.0);
++                        dense.row_mut(i).copy_from_slice(v.data());
++                    }
++                    super::FastText::build_inference_model(
++                        &self.args,
++                        &self.dict,
++                        &self.input,
++                        &std::sync::Arc::new(dense),
++                        &self.loss_tables,
++                    )
++                });
++                model.loss.predict(k, threshold, &mut heap, state);
++                return heap;
++            }
++            _ => {}
++        }
++
++        // Compute raw output scores (softmax / one-vs-all with quantized output).
++        let osz = nlabels;
++        if let Some(qout) = &self.quant_output {
++            for (i, out) in state.output.data_mut()[..osz].iter_mut().enumerate() {
++                *out = qout.dot_row(&state.hidden, i as i64);
+             }
+         }
+ 
+@@ -165,13 +219,12 @@
+                 }
+             }
+             _ => {
+-                // Softmax (and NS, which also uses softmax for prediction).
++                // Softmax (HS / NS are handled above).
+                 utils::softmax_in_place(&mut state.output.data_mut()[..osz]);
+             }
+         }
+ 
+         // Find top-k predictions above threshold.
+-        let mut heap = Predictions::new();
+         find_k_best(k as usize, threshold, &mut heap, &state.output);
+         heap
+     }
+diff -ru a/src/fasttext/quantize.rs b/src/fasttext/quantize.rs
+--- a/src/fasttext/quantize.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/fasttext/quantize.rs	2026-10-05 00:15:27.594707600 -0400
+@@ -1,8 +1,6 @@
+-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
++use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
+ use std::sync::Arc;
+ 
+-use rayon::prelude::*;
+-
+ use crate::args::{Args, ModelName};
+ use crate::dictionary::{EntryType, EOS};
+ use crate::error::{FastTextError, Result};
+@@ -78,6 +76,7 @@
+         let mut input_data: Vec<f32> = self.input.data().to_vec();
+ 
+         let cutoff = qargs.cutoff;
++        let mut retrained = false;
+         if cutoff > 0 && cutoff < input_m as usize {
+             let idx = self.select_embeddings(cutoff);
+ 
+@@ -121,6 +120,7 @@
+                 let pruned_dense = DenseMatrix::from_data(pruned_m, input_n, &input_data);
+                 let pruned_arc = Arc::new(pruned_dense);
+                 self.retrain_after_prune(Arc::clone(&pruned_arc), qargs)?;
++                retrained = true;
+                 // After retrain, use the (updated) pruned input data.
+                 input_data = pruned_arc.data().to_vec();
+                 // Update self.input so get_word_vector still works on dense models.
+@@ -142,14 +142,36 @@
+             // C++ uses dsub=2 and passes the qnorm flag for the output matrix.
+             let quant_out = QuantMatrix::from_dense(&output_data, out_m, out_n, 2, qnorm);
+             self.quant_output = Some(quant_out);
++            self.qout_model = std::sync::OnceLock::new();
+         }
+ 
+         // Mark model as quantized and update args.
+         self.quant = true;
+         let mut new_args = (*self.args).clone();
+         new_args.qout = qargs.qout;
++        // [fasttext-python-bindings patch] Like C++, a retrain overwrites epoch / lr / thread /
++        // verbose in the model args (`epoch` is part of the saved file).
++        if retrained {
++            new_args.epoch = qargs.epoch;
++            new_args.lr = qargs.lr;
++            new_args.thread = qargs.thread;
++            new_args.verbose = qargs.verbose;
++        }
+         self.args = Arc::new(new_args);
+ 
++        // [fasttext-python-bindings patch] Drop the dense input matrix (C++ moves it into the
++        // QuantMatrix): the quantized path never reads it, and keeping it held on to the whole
++        // dense matrix (often hundreds of MB) next to the few-MB quantized one.
++        let empty = Arc::new(DenseMatrix::new(0, 0));
++        self.model = Self::build_inference_model(
++            &self.args,
++            &self.dict,
++            &empty,
++            &self.output,
++            &self.loss_tables,
++        );
++        self.input = empty;
++
+         Ok(())
+     }
+ 
+@@ -174,6 +196,7 @@
+         retrain_args.epoch = qargs.epoch;
+         retrain_args.lr = qargs.lr;
+         retrain_args.thread = qargs.thread;
++        retrain_args.verbose = qargs.verbose; // [fasttext-python-bindings patch] C++ does this
+ 
+         let n_threads = (retrain_args.thread as usize).max(1);
+         let output_size = self.output.rows() as usize;
+@@ -185,34 +208,59 @@
+         let shared_loss = Arc::new(AtomicU64::new(f64::to_bits(0.0)));
+         let shared_loss_count = Arc::new(AtomicI64::new(0));
+         let abort_flag = Arc::new(AtomicBool::new(false));
++        let progress_loss = AtomicU32::new((-1.0f32).to_bits());
++        let start = std::time::Instant::now();
+ 
+-        let training_results: Vec<Result<()>> = (0..n_threads)
+-            .into_par_iter()
+-            .map(|thread_id| {
+-                let loss = build_loss(
+-                    &retrain_args,
+-                    Arc::clone(&output),
+-                    &target_counts,
+-                    Arc::clone(&self.loss_tables),
+-                );
+-                let model = Model::new(Arc::clone(&pruned_input), loss, normalize_gradient);
+-                let ctx = TrainThreadCtx {
+-                    args: &retrain_args,
+-                    dict: &self.dict,
+-                    model: &model,
+-                    output_size,
+-                    token_count: &token_count,
+-                    abort_flag: &abort_flag,
+-                    shared_loss: &shared_loss,
+-                    epoch_loss_tracker: None,
+-                };
+-                Self::train_thread_inner(thread_id, n_threads, &ctx, &shared_loss_count)
+-            })
+-            .collect();
++        // [fasttext-python-bindings patch] Dedicated OS threads (see `run_hogwild_training`).
++        let training_results: Vec<Result<()>> = std::thread::scope(|s| {
++            let handles: Vec<_> = (0..n_threads)
++                .map(|thread_id| {
++                    let (retrain_args, output, target_counts, pruned_input) =
++                        (&retrain_args, &output, &target_counts, &pruned_input);
++                    let (token_count, abort_flag, shared_loss, shared_loss_count) =
++                        (&token_count, &abort_flag, &shared_loss, &shared_loss_count);
++                    let progress_loss = &progress_loss;
++                    s.spawn(move || {
++                        let loss = build_loss(
++                            retrain_args,
++                            Arc::clone(output),
++                            target_counts,
++                            Arc::clone(&self.loss_tables),
++                        );
++                        let model = Model::new(Arc::clone(pruned_input), loss, normalize_gradient);
++                        let ctx = TrainThreadCtx {
++                            args: retrain_args,
++                            dict: &self.dict,
++                            model: &model,
++                            output_size,
++                            token_count,
++                            abort_flag,
++                            shared_loss,
++                            epoch_loss_tracker: None,
++                            progress_loss,
++                        };
++                        Self::train_thread_inner(thread_id, n_threads, &ctx, shared_loss_count)
++                    })
++                })
++                .collect();
++            Self::wait_with_progress(
++                &retrain_args,
++                self.dict.ntokens(),
++                &handles,
++                &token_count,
++                &progress_loss,
++                start,
++            );
++            handles
++                .into_iter()
++                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
++                .collect()
++        });
+ 
+         for r in training_results {
+             r?;
+         }
++        Self::print_final_progress(&retrain_args, &token_count, &progress_loss, start);
+ 
+         Ok(())
+     }
+diff -ru a/src/fasttext/train.rs b/src/fasttext/train.rs
+--- a/src/fasttext/train.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/fasttext/train.rs	2026-10-04 23:53:25.281680400 -0400
+@@ -1,9 +1,8 @@
+ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+ use std::path::Path;
+-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex};
+-
+-use rayon::prelude::*;
++use std::time::{Duration, Instant};
+ 
+ use crate::args::{Args, LossName, ModelName};
+ use crate::dictionary::{Dictionary, EntryType};
+@@ -70,7 +69,7 @@
+     /// Steps:
+     /// 1. Read input file and build vocabulary.
+     /// 2. Initialize matrices.
+-    /// 3. Run training in parallel using rayon (Hogwild! SGD).
++    /// 3. Run training in parallel on `args.thread` OS threads (Hogwild! SGD).
+     /// 4. Return a trained `FastText` instance.
+     pub fn train_with_abort(args: Args, abort_flag: Arc<AtomicBool>) -> Result<Self> {
+         Self::train_internal(args, abort_flag, None)
+@@ -129,6 +128,7 @@
+     fn initialize_matrices(
+         args: &Args,
+         dict: &Dictionary,
++        pretrained: Option<&[(String, Vec<f32>)]>,
+     ) -> Result<(Arc<DenseMatrix>, Arc<DenseMatrix>)> {
+         let nwords = dict.nwords() as i64;
+         let bucket = args.bucket as i64;
+@@ -137,8 +137,15 @@
+         let input = Arc::new({
+             let mut m = DenseMatrix::new(nwords + bucket, dim);
+             m.uniform(1.0 / args.dim as f32, args.seed);
+-            if !args.pretrained_vectors.as_os_str().is_empty() {
+-                Self::load_pretrained_vectors(&args.pretrained_vectors, args, dict, &mut m)?;
++            // [fasttext-python-bindings patch] Pretrained rows were read (and their words
++            // added to the dictionary) before the matrix was sized, like C++
++            // `getInputMatrixFromFile`.
++            for (word, vec) in pretrained.unwrap_or_default() {
++                if let Some(idx) = dict.get_id(word) {
++                    if idx < dict.nwords() {
++                        m.row_mut(idx as i64).copy_from_slice(vec);
++                    }
++                }
+             }
+             m
+         });
+@@ -187,38 +194,129 @@
+         let token_count = AtomicI64::new(0);
+         let shared_loss = AtomicU64::new(f64::to_bits(0.0));
+         let shared_loss_count = AtomicI64::new(0);
++        let progress_loss = AtomicU32::new((-1.0f32).to_bits());
++        let start = Instant::now();
+ 
+-        let training_results: Vec<Result<()>> = (0..n_threads)
+-            .into_par_iter()
+-            .map(|thread_id| {
+-                let loss = build_loss(
+-                    args,
+-                    Arc::clone(output),
+-                    &target_counts,
+-                    Arc::clone(loss_tables),
+-                );
+-                let model = Model::new(Arc::clone(input), loss, normalize_gradient);
+-                let ctx = TrainThreadCtx {
+-                    args,
+-                    dict,
+-                    model: &model,
+-                    output_size,
+-                    token_count: &token_count,
+-                    abort_flag,
+-                    shared_loss: &shared_loss,
+-                    epoch_loss_tracker: epoch_loss_tracker.clone(),
+-                };
+-                Self::train_thread_inner(thread_id, n_threads, &ctx, &shared_loss_count)
+-            })
+-            .collect();
++        // [fasttext-python-bindings patch] One dedicated OS thread per `args.thread`, like C++
++        // `startThreads`. Running the workers as tasks on rayon's global pool serialised them
++        // whenever the pool had fewer threads than `args.thread` (e.g. RAYON_NUM_THREADS=4,
++        // thread=12), which changes the lr schedule and data partitioning C++ relies on.
++        let training_results: Vec<Result<()>> = std::thread::scope(|s| {
++            let handles: Vec<_> = (0..n_threads)
++                .map(|thread_id| {
++                    let (token_count, shared_loss, shared_loss_count, progress_loss) = (
++                        &token_count,
++                        &shared_loss,
++                        &shared_loss_count,
++                        &progress_loss,
++                    );
++                    let tracker = epoch_loss_tracker.clone();
++                    let target_counts = &target_counts;
++                    s.spawn(move || {
++                        let loss = build_loss(
++                            args,
++                            Arc::clone(output),
++                            target_counts,
++                            Arc::clone(loss_tables),
++                        );
++                        let model = Model::new(Arc::clone(input), loss, normalize_gradient);
++                        let ctx = TrainThreadCtx {
++                            args,
++                            dict,
++                            model: &model,
++                            output_size,
++                            token_count,
++                            abort_flag,
++                            shared_loss,
++                            epoch_loss_tracker: tracker,
++                            progress_loss,
++                        };
++                        Self::train_thread_inner(thread_id, n_threads, &ctx, shared_loss_count)
++                    })
++                })
++                .collect();
++            Self::wait_with_progress(
++                args,
++                dict.ntokens(),
++                &handles,
++                &token_count,
++                &progress_loss,
++                start,
++            );
++            handles
++                .into_iter()
++                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
++                .collect()
++        });
+ 
+         for result in training_results {
+             result?;
+         }
++        Self::print_final_progress(args, &token_count, &progress_loss, start);
+ 
+         Ok(Self::compute_avg_loss(&shared_loss, &shared_loss_count))
+     }
+ 
++    /// [fasttext-python-bindings patch] C++ `startThreads` progress loop: with `verbose > 1`,
++    /// print a `Progress:` line to stderr every 100 ms until all workers have finished.
++    pub(super) fn wait_with_progress<T>(
++        args: &Args,
++        ntokens: i64,
++        handles: &[std::thread::ScopedJoinHandle<'_, T>],
++        token_count: &AtomicI64,
++        progress_loss: &AtomicU32,
++        start: Instant,
++    ) {
++        if args.verbose <= 1 {
++            return;
++        }
++        while !handles.iter().all(|h| h.is_finished()) {
++            std::thread::sleep(Duration::from_millis(100));
++            let loss = f32::from_bits(progress_loss.load(Ordering::Relaxed));
++            if loss >= 0.0 {
++                let tc = token_count.load(Ordering::Relaxed);
++                let progress = tc as f64 / (args.epoch as f64 * ntokens as f64);
++                eprint!("\r{}", Self::progress_info(args, progress, loss, tc, start));
++            }
++        }
++    }
++
++    /// [fasttext-python-bindings patch] Final C++ progress line (`verbose > 0`).
++    pub(super) fn print_final_progress(
++        args: &Args,
++        token_count: &AtomicI64,
++        progress_loss: &AtomicU32,
++        start: Instant,
++    ) {
++        if args.verbose > 0 {
++            let loss = f32::from_bits(progress_loss.load(Ordering::Relaxed));
++            let tc = token_count.load(Ordering::Relaxed);
++            eprintln!("\r{}", Self::progress_info(args, 1.0, loss, tc, start));
++        }
++    }
++
++    /// C++ `FastText::printInfo`.
++    fn progress_info(args: &Args, progress: f64, loss: f32, tc: i64, start: Instant) -> String {
++        let t = start.elapsed().as_secs_f64();
++        let lr = args.lr * (1.0 - progress);
++        let (mut pct, mut wst, mut eta) = (progress, 0.0f64, 2_592_000i64);
++        if progress > 0.0 && t >= 0.0 {
++            pct = progress * 100.0;
++            eta = (t * (100.0 - pct) / pct) as i64;
++            wst = tc as f64 / t / args.thread.max(1) as f64;
++        }
++        format!(
++            "Progress: {:5.1}% words/sec/thread: {:7} lr: {:9.6} avg.loss: {:9.6} ETA: {:3}h{:2}m{:2}s",
++            pct,
++            wst as i64,
++            lr,
++            loss,
++            eta / 3600,
++            (eta % 3600) / 60,
++            eta % 60
++        )
++    }
++
+     /// Internal training implementation with optional epoch loss tracking.
+     fn train_internal(
+         args: Args,
+@@ -232,8 +330,32 @@
+         }
+ 
+         let args_arc = Arc::new(args.clone());
+-        let dict = Self::build_vocabulary(&args, &args_arc)?;
+-        let (input, output) = Self::initialize_matrices(&args, &dict)?;
++        let mut dict = Self::build_vocabulary(&args, &args_arc)?;
++        if args.verbose > 0 {
++            // [fasttext-python-bindings patch] C++ `Dictionary::readFromFile` summary.
++            eprintln!(
++                "\rRead {}M words\nNumber of words:  {}\nNumber of labels: {}",
++                dict.ntokens() / 1_000_000,
++                dict.nwords(),
++                dict.nlabels()
++            );
++        }
++        // [fasttext-python-bindings patch] C++ `getInputMatrixFromFile` adds every word of the
++        // pretrained `.vec` file to the dictionary (`threshold(1, 0)` + `init()`), so that
++        // pretrained words missing from (or rare in) the training data still get their vectors.
++        // The crate used to only overwrite rows of words already in the vocabulary.
++        let pretrained = if args.pretrained_vectors.as_os_str().is_empty() {
++            None
++        } else {
++            let pv = Self::load_pretrained_vectors(&args.pretrained_vectors, &args)?;
++            for (word, _) in &pv {
++                dict.add(word);
++            }
++            dict.threshold(1, 0);
++            dict.init();
++            Some(pv)
++        };
++        let (input, output) = Self::initialize_matrices(&args, &dict, pretrained.as_deref())?;
+         let loss_tables = Arc::new(LossTables::new());
+ 
+         let avg_loss = Self::run_hogwild_training(
+@@ -260,6 +382,7 @@
+             abort_flag,
+             last_train_loss: avg_loss,
+             loss_tables,
++            qout_model: std::sync::OnceLock::new(),
+         })
+     }
+ 
+@@ -326,15 +449,8 @@
+         Ok((n, vec_dim))
+     }
+ 
+-    /// Parse one line of a `.vec` file and write it into the input matrix.
+-    ///
+-    /// Returns `Ok(())` on success, propagating errors for malformed lines.
+-    fn apply_pretrained_line(
+-        line: &str,
+-        dim: usize,
+-        dict: &Dictionary,
+-        input: &mut DenseMatrix,
+-    ) -> Result<()> {
++    /// Parse one line of a `.vec` file into `(word, vector)`.
++    fn parse_pretrained_line(line: &str, dim: usize) -> Result<(String, Vec<f32>)> {
+         let mut parts = line.split_whitespace();
+         let word = parts.next().ok_or_else(|| {
+             FastTextError::InvalidModel("Missing word in pretrained vectors line".to_string())
+@@ -360,26 +476,15 @@
+             vec.push(val);
+         }
+ 
+-        if let Some(idx) = dict.get_id(word) {
+-            if idx < dict.nwords() {
+-                let row = input.row_mut(idx as i64);
+-                row.copy_from_slice(&vec);
+-            }
+-        }
+-        Ok(())
++        Ok((word.to_string(), vec))
+     }
+ 
+-    /// Load pretrained word vectors from a `.vec` file into the input matrix.
++    /// Read pretrained word vectors from a `.vec` file.
+     ///
+     /// The `.vec` format (same as C++ fastText output):
+     /// - First line: `<n_words> <dim>` (header)
+     /// - Each subsequent line: `<word> <val1> <val2> ... <val_dim>`
+-    fn load_pretrained_vectors(
+-        path: &Path,
+-        args: &Args,
+-        dict: &Dictionary,
+-        input: &mut DenseMatrix,
+-    ) -> Result<()> {
++    fn load_pretrained_vectors(path: &Path, args: &Args) -> Result<Vec<(String, Vec<f32>)>> {
+         let file = std::fs::File::open(path).map_err(FastTextError::IoError)?;
+         let reader = std::io::BufReader::new(file);
+         let mut lines = reader.lines();
+@@ -394,6 +499,7 @@
+         let (n, vec_dim) = Self::parse_vec_header(&header, args.dim)?;
+         let dim = vec_dim as usize;
+ 
++        let mut out = Vec::with_capacity(n.max(0) as usize);
+         for _ in 0..n {
+             let line = lines
+                 .next()
+@@ -401,10 +507,10 @@
+                     FastTextError::InvalidModel("Pretrained vectors file is truncated".to_string())
+                 })?
+                 .map_err(FastTextError::IoError)?;
+-            Self::apply_pretrained_line(&line, dim, dict, input)?;
++            out.push(Self::parse_pretrained_line(&line, dim)?);
+         }
+ 
+-        Ok(())
++        Ok(out)
+     }
+ 
+     /// Signal an in-progress training run to stop early.
+@@ -615,6 +721,10 @@
+                 ctx.token_count
+                     .fetch_add(local_token_count, Ordering::Relaxed);
+                 local_token_count = 0;
++                if thread_id == 0 && ctx.args.verbose > 1 {
++                    ctx.progress_loss
++                        .store(state.get_loss().to_bits(), Ordering::Relaxed);
++                }
+             }
+         }
+ 
+diff -ru a/src/loss.rs b/src/loss.rs
+--- a/src/loss.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/loss.rs	2026-10-04 21:28:31.413911500 -0400
+@@ -19,7 +19,7 @@
+ 
+ use crate::matrix::{DenseMatrix, Matrix};
+ use crate::model::{MinstdRng, Predictions, State};
+-use crate::utils::{self, OrdF32};
++use crate::utils;
+ use crate::vector::Vector;
+ 
+ // Constants
+@@ -41,9 +41,92 @@
+ /// The small addend prevents log(0) = -∞.  C++ uses `1e-5` (double literal)
+ /// but the result is truncated to `real` (float); using `1e-5_f32` here
+ /// produces the same output since the difference is below f32 epsilon.
++///
++/// [fasttext-python-bindings patch] Computed in `f64` exactly like C++
++/// (`std::log(x + 1e-5)` with a double literal, then narrowed), so that scores, ties and
++/// threshold comparisons are bit-identical to C++ fastText.
+ #[inline]
+ pub fn std_log(x: f32) -> f32 {
+-    (x + 1e-5_f32).ln()
++    ((x as f64) + 1e-5).ln() as f32
++}
++
++// [fasttext-python-bindings patch] libstdc++-compatible binary heap.
++//
++// C++ fastText keeps its top-k candidates in a `std::vector` managed with
++// `std::push_heap` / `std::pop_heap` / `std::sort_heap` and the comparator
++// `l.first > r.first`. Re-implementing the exact libstdc++ algorithms makes the
++// order of *tied* predictions (common with the table-based sigmoid of OVA / NS
++// losses) identical to the C++ package.
++
++#[inline]
++fn heap_cmp(l: &(f32, i32), r: &(f32, i32)) -> bool {
++    l.0 > r.0
++}
++
++/// libstdc++ `__push_heap`.
++fn heap_sift_up(h: &mut [(f32, i32)], mut hole: usize, top: usize, value: (f32, i32)) {
++    while hole > top {
++        let parent = (hole - 1) / 2;
++        if !heap_cmp(&h[parent], &value) {
++            break;
++        }
++        h[hole] = h[parent];
++        hole = parent;
++    }
++    h[hole] = value;
++}
++
++/// libstdc++ `__adjust_heap` (`len >= 1`).
++fn heap_adjust(h: &mut [(f32, i32)], mut hole: usize, len: usize, value: (f32, i32)) {
++    let top = hole;
++    let mut second = hole;
++    while second < (len - 1) / 2 {
++        second = 2 * (second + 1);
++        if heap_cmp(&h[second], &h[second - 1]) {
++            second -= 1;
++        }
++        h[hole] = h[second];
++        hole = second;
++    }
++    if len & 1 == 0 && second == (len - 2) / 2 {
++        second = 2 * (second + 1);
++        h[hole] = h[second - 1];
++        hole = second - 1;
++    }
++    heap_sift_up(h, hole, top, value);
++}
++
++/// libstdc++ `__pop_heap(first, first + last, first + last)`.
++fn heap_pop_to(h: &mut [(f32, i32)], last: usize) {
++    let value = h[last];
++    h[last] = h[0];
++    heap_adjust(h, 0, last, value);
++}
++
++/// `std::push_heap` on the whole vector (new element already pushed at the back).
++pub(crate) fn cpp_push_heap(h: &mut [(f32, i32)]) {
++    let n = h.len();
++    if n > 1 {
++        let v = h[n - 1];
++        heap_sift_up(h, n - 1, 0, v);
++    }
++}
++
++/// `std::pop_heap` (moves the front to the back; caller pops it).
++pub(crate) fn cpp_pop_heap(h: &mut [(f32, i32)]) {
++    let n = h.len();
++    if n > 1 {
++        heap_pop_to(h, n - 1);
++    }
++}
++
++/// `std::sort_heap`: result is sorted by descending score.
++pub(crate) fn cpp_sort_heap(h: &mut [(f32, i32)]) {
++    let mut last = h.len();
++    while last > 1 {
++        last -= 1;
++        heap_pop_to(h, last);
++    }
+ }
+ 
+ // Precomputed tables
+@@ -173,35 +256,24 @@
+     if k == 0 {
+         return;
+     }
+-    use std::cmp::Reverse;
+-    use std::collections::BinaryHeap;
+-
+-    // Min-heap keyed on raw probability (smallest at top) via Reverse.
+-    // Since std_log is monotonically increasing, ordering by raw score
+-    // gives the same top-k as ordering by log-score. We only compute
+-    // std_log for the final k survivors, avoiding ln() on all other labels.
+-    let mut min_heap: BinaryHeap<Reverse<(OrdF32, i32)>> = BinaryHeap::with_capacity(k + 1);
+-
+-    for (i, &score) in output.data().iter().enumerate() {
+-        if score < threshold {
++    // [fasttext-python-bindings patch] Exact port of C++ `Loss::findKBest` +
++    // `std::sort_heap` (same comparisons, same libstdc++ heap => same tie order).
++    for (i, &p) in output.data().iter().enumerate() {
++        if p < threshold {
+             continue;
+         }
+-        if min_heap.len() == k && score < min_heap.peek().unwrap().0 .0 .0 {
++        let s = std_log(p);
++        if heap.len() == k && s < heap[0].0 {
+             continue;
+         }
+-        min_heap.push(Reverse((OrdF32(score), i as i32)));
+-        if min_heap.len() > k {
+-            min_heap.pop();
++        heap.push((s, i as i32));
++        cpp_push_heap(heap);
++        if heap.len() > k {
++            cpp_pop_heap(heap);
++            heap.pop();
+         }
+     }
+-
+-    // Convert survivors to log-probability and sort descending.
+-    heap.extend(
+-        min_heap
+-            .into_iter()
+-            .map(|Reverse((OrdF32(s), idx))| (std_log(s), idx)),
+-    );
+-    heap.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
++    cpp_sort_heap(heap);
+ }
+ 
+ // BinaryLogisticBase — shared helper for OVA, NS, HS
+@@ -567,28 +639,27 @@
+         if score < log_threshold {
+             return;
+         }
+-        if heap.len() == k && !heap.is_empty() && score < heap.last().unwrap().0 {
++        // [fasttext-python-bindings patch] libstdc++ heap, exactly like C++ `dfs`.
++        if heap.len() == k && !heap.is_empty() && score < heap[0].0 {
+             return;
+         }
+ 
+         let n = &self.tree[node];
+         if n.left == -1 && n.right == -1 {
+-            // Leaf node: insert into heap maintaining descending sort order
+-            let pos = heap
+-                .iter()
+-                .position(|&(s, _)| s < score)
+-                .unwrap_or(heap.len());
+-            heap.insert(pos, (score, node as i32));
++            heap.push((score, node as i32));
++            cpp_push_heap(heap);
+             if heap.len() > k {
+-                heap.pop(); // Remove the minimum (last element)
++                cpp_pop_heap(heap);
++                heap.pop();
+             }
+             return;
+         }
+ 
+         // Internal node: exact sigmoid of wo[node - osz] · hidden
++        // (C++: `f = 1. / (1 + std::exp(-f))`, i.e. the division happens in double).
+         let matrix_row = node as i32 - self.osz;
+         let f_raw = self.base.wo.dot_row(hidden, matrix_row as i64);
+-        let f = 1.0_f32 / (1.0 + (-f_raw).exp()); // exact sigmoid
++        let f = (1.0_f64 / (1.0_f32 + (-f_raw).exp()) as f64) as f32;
+ 
+         let left = self.tree[node].left as usize;
+         let right = self.tree[node].right as usize;
+@@ -659,8 +730,8 @@
+         let root = (2 * self.osz - 2) as usize;
+         let hidden = &state.hidden;
+         self.dfs_with_hidden(k as usize, threshold, root, 0.0, heap, hidden);
+-        // Sort descending (highest log-prob first)
+-        heap.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
++        // [fasttext-python-bindings patch] C++ `std::sort_heap` (descending, same tie order).
++        cpp_sort_heap(heap);
+     }
+ }
+ 
+diff -ru a/src/matrix.rs b/src/matrix.rs
+--- a/src/matrix.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/matrix.rs	2026-10-04 23:53:25.516060200 -0400
+@@ -236,20 +236,37 @@
+         let block_size = total / 10;
+         let data = self.data_mut();
+ 
+-        for block in 0..10 {
+-            let start = block_size * block;
+-            let end = if block == 9 {
+-                total
+-            } else {
+-                (block_size * (block + 1)).min(total)
+-            };
++        let fill = |block: usize, chunk: &mut [f32]| {
+             // Seed matches C++: std::minstd_rand rng(block + seed)
+             let mut rng = MinstdRng::new((block as u64).wrapping_add(seed as u32 as u64));
+-            for item in data.iter_mut().take(end).skip(start) {
++            for item in chunk {
+                 // uniform_real() returns [0, 1), map to [-a, a]
+                 let u = rng.uniform_real();
+                 *item = (u * 2.0 * a as f64 - a as f64) as f32;
+             }
++        };
++        // [fasttext-python-bindings patch] The 10 blocks are independent (one RNG each), so
++        // large matrices fill them in parallel on the rayon pool (C++ also initialises with
++        // one thread per block). The values are identical to the sequential loop.
++        if block_size == 0 || total < 1 << 20 {
++            for block in 0..10 {
++                let start = block_size * block;
++                let end = if block == 9 {
++                    total
++                } else {
++                    (block_size * (block + 1)).min(total)
++                };
++                fill(block, &mut data[start..end]);
++            }
++        } else {
++            use rayon::prelude::*;
++            let (head, last) = data.split_at_mut(block_size * 9);
++            let mut chunks: Vec<&mut [f32]> = head.chunks_mut(block_size).collect();
++            chunks.push(last);
++            chunks
++                .into_par_iter()
++                .enumerate()
++                .for_each(|(block, chunk)| fill(block, chunk));
+         }
+     }
+ 
+diff -ru a/src/simd/mod.rs b/src/simd/mod.rs
+--- a/src/simd/mod.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/simd/mod.rs	2026-10-04 21:28:06.971448100 -0400
+@@ -1,3 +1,4 @@
++#![cfg_attr(not(feature = "simd-dot"), allow(dead_code))] // [fasttext-python-bindings patch]
+ // Shared SIMD kernels for dot product, vector addition, and row averaging.
+ //
+ // Organized by target feature level:
+@@ -62,6 +63,24 @@
+ /// Dispatch dot product to best available implementation.
+ #[inline]
+ pub(crate) fn dot_impl(a: &[f32], b: &[f32]) -> f32 {
++    // [fasttext-python-bindings patch] Sequential scalar accumulation, exactly like C++
++    // `DenseMatrix::dotRow` (`d += at(i, j) * vec[j]`). The SIMD/FMA variants below reorder
++    // and fuse the additions, which changes results in the last bits and can flip the order
++    // of near-tied predictions relative to the C++ package. Output dot products are a small
++    // share of inference time (hidden-layer averaging dominates).
++    #[cfg(not(feature = "simd-dot"))]
++    {
++        dot_scalar(a, b)
++    }
++    #[cfg(feature = "simd-dot")]
++    {
++        dot_impl_simd(a, b)
++    }
++}
++
++#[cfg(feature = "simd-dot")]
++#[inline]
++fn dot_impl_simd(a: &[f32], b: &[f32]) -> f32 {
+     #[cfg(target_arch = "aarch64")]
+     {
+         neon::dot(a, b)
+diff -ru a/src/utils.rs b/src/utils.rs
+--- a/src/utils.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/utils.rs	2026-10-04 21:26:13.034504500 -0400
+@@ -100,9 +100,9 @@
+         z += *v;
+     }
+     if z > 0.0 {
+-        let inv_z = 1.0 / z;
++        // [fasttext-python-bindings patch] divide (C++ `output[i] /= z`), not multiply by 1/z.
+         for v in data.iter_mut() {
+-            *v *= inv_z;
++            *v /= z;
+         }
+     }
+ }

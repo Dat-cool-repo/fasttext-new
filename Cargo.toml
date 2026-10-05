@@ -1,0 +1,39 @@
+[package]
+name = "fasttext-new"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Dat-cool-repo"]
+license = "MIT OR Apache-2.0"
+description = "fastText-compatible Python bindings (PyO3) on top of the pure-Rust `fasttext` crate"
+repository = "https://github.com/Dat-cool-repo/fasttext-new"
+homepage = "https://github.com/Dat-cool-repo/fasttext-new"
+readme = "README.md"
+keywords = ["fasttext", "language-identification", "text-classification", "python", "pyo3"]
+publish = false
+
+[lib]
+name = "fasttext_new"
+# cdylib for the Python extension, rlib so `cargo test` can exercise the pure-Rust core.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enabled by maturin (see pyproject.toml). Plain `cargo test` builds without PyO3.
+python = ["dep:pyo3"]
+
+[dependencies]
+fasttext = "0.8"
+rayon = "1.10"
+# generate-import-lib: link Windows abi3 builds against python3.dll without a Windows Python
+# (used for cross-compiling with mingw-w64; no effect on other targets).
+pyo3 = { version = "0.29", features = ["abi3-py39", "generate-import-lib"], optional = true }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+# Vendored `fasttext` 0.8.0 with correctness/parity/perf fixes
+# (see vendor/fasttext-0.8.0-fixes.patch). Remove once fixed upstream.
+[patch.crates-io]
+fasttext = { path = "vendor/fasttext" }
