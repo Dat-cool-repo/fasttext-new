@@ -384,3 +384,33 @@ def sysconfig_free_threaded() -> bool:
     import sysconfig
 
     return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
+
+@pytest.mark.skipif(not sysconfig_free_threaded(), reason="free-threaded CPython only")
+@pytest.mark.skipif((os.cpu_count() or 1) < 3, reason="needs 3+ CPUs")
+def test_free_threaded_predict_scales_across_threads(softmax_model):
+    """On free-threaded Python, predict(str) on short lines (GIL never released) runs in
+    parallel across Python threads."""
+    m = softmax_model
+    texts = TEXTS[:6] * 400
+    n = min(4, os.cpu_count() or 1)
+
+    def work(chunk):
+        for t in chunk:
+            m.predict(t, k=2)
+
+    def timed(nthreads):
+        threads = [threading.Thread(target=work, args=(texts,)) for _ in range(nthreads)]
+        t0 = time.perf_counter()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return time.perf_counter() - t0
+
+    best = 0.0
+    for _ in range(3):  # shared CI machines are noisy: best of 3
+        one = timed(1)
+        many = timed(n)
+        best = max(best, n * one / many)  # speed-up over running the n workloads serially
+    assert best > 1.3, f"{n} threads only {best:.2f}x faster than serial"

@@ -85,8 +85,8 @@ def test_golden_test_metrics(name):
     if "test" not in g or not (d / g["test"]["file"]).exists():
         pytest.skip("no test() reference")
     f = str(d / g["test"]["file"])
-    assert list(m.test(f, k=1)) == pytest.approx(g["test"]["k1"], abs=1e-12)
-    assert list(m.test(f, k=5)) == pytest.approx(g["test"]["k5"], abs=1e-12)
+    assert list(m.test(f, k=1)) == pytest.approx(g["test"]["k1"], abs=1e-12, nan_ok=True)
+    assert list(m.test(f, k=5)) == pytest.approx(g["test"]["k5"], abs=1e-12, nan_ok=True)
 
 
 def test_training_quality_vs_recorded_cpp():

@@ -1,5 +1,5 @@
 # Checks against the C++ package that need downloads or take a while. Manual only:
-#   gh workflow run reference
+#   gh workflow run reference [-f only=golden-tiny|full-suite|real-data]
 #
 # * golden-tiny: regenerates tests/data/golden/tiny_*.json (C++ outputs of the committed tiny
 #   models) and uploads them as an artifact.
@@ -14,6 +14,13 @@ name: reference
 
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        description: "Run only this job (default: all)"
+        required: false
+        default: all
+        type: choice
+        options: [all, golden-tiny, full-suite, real-data]
 
 permissions:
   contents: read
@@ -27,6 +34,7 @@ defaults:
 
 jobs:
   golden-tiny:
+    if: inputs.only == 'all' || inputs.only == 'golden-tiny'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,11 +46,13 @@ jobs:
       - run: python scripts/make_golden.py --tiny
       - run: python -m pytest -q -p no:cacheprovider tests/test_golden.py -k tiny
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: golden-tiny
           path: tests/data/golden/tiny_*.json
 
   full-suite:
+    if: inputs.only == 'all' || inputs.only == 'full-suite'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -65,6 +75,7 @@ jobs:
           path: pytest.log
 
   real-data:
+    if: inputs.only == 'all' || inputs.only == 'real-data'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
