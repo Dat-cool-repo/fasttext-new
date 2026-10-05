@@ -87,7 +87,19 @@ def record_tiny(model_path: Path, texts: list[str], test_file: Path) -> dict:
     out["subwords"] = {w: [list(a), [int(i) for i in b]] for w, (a, b) in ((w, m.get_subwords(w)) for w in words)}
     out["word_ids"] = {w: m.get_word_id(w) for w in words}
     out["subword_ids"] = {w: m.get_subword_id(w) for w in ["ab", "ppl", "東京"]} if m.f.getArgs().bucket else {}
-    return out
+    return _round(out)
+
+
+def _round(x, nd: int = 8):
+    """Round probabilities and vectors to 8 decimals (the tests compare at 1e-5) to keep the
+    checked-in files small. test() / test_label() metrics are compared at 1e-12 and kept exact."""
+    if isinstance(x, float):
+        return round(x, nd)
+    if isinstance(x, list):
+        return [_round(v, nd) for v in x]
+    if isinstance(x, dict):
+        return {k: (v if k in ("test", "test_label") else _round(v, nd)) for k, v in x.items()}
+    return x
 
 
 def write_tiny_goldens(small: list[str], checked_in: Path) -> None:
@@ -95,10 +107,11 @@ def write_tiny_goldens(small: list[str], checked_in: Path) -> None:
     tiny = HERE / "tests/data/models"
     train_tiny = tiny / "train_tiny.txt"
     if train_tiny.exists():
-        # (the two very long edge cases are covered by lid.176.ftz.json; skip them to stay small)
-        tiny_texts = [t for t in small if len(t) < 1000] + [
+        # Every 2nd checked-in sentence, the short edge cases (the two very long ones are covered
+        # by lid.176.ftz.json) and 30 lines of the training file: small files, all code paths.
+        tiny_texts = small[:-len(EDGE_CASES)][::2] + [t for t in EDGE_CASES if len(t) < 1000] + [
             " ".join(w for w in line.split() if not w.startswith("__label__"))
-            for line in train_tiny.read_text(encoding="utf-8").splitlines()[:40]
+            for line in train_tiny.read_text(encoding="utf-8").splitlines()[:30]
         ]
         for p in sorted(tiny.glob("tiny_*")):
             g = record_tiny(p, tiny_texts, train_tiny)
