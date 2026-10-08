@@ -409,8 +409,10 @@ def test_free_threaded_predict_scales_across_threads(softmax_model):
         return time.perf_counter() - t0
 
     best = 0.0
-    for _ in range(3):  # shared CI machines are noisy: best of 3
+    for _ in range(5):  # shared CI machines are noisy: best of 5
         one = timed(1)
         many = timed(n)
         best = max(best, n * one / many)  # speed-up over running the n workloads serially
-    assert best > 1.3, f"{n} threads only {best:.2f}x faster than serial"
+    # Serialised threads give about 1.0x. The bound stays well above that but below what a busy
+    # 3-vCPU runner reaches (macOS 14 on GitHub measured 1.23x once, against 1.3x+ usually).
+    assert best > 1.15, f"{n} threads only {best:.2f}x faster than serial"
