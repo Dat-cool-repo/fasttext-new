@@ -7,7 +7,8 @@
 #   No cp313t wheel: PyO3 0.29 only supports the free-threaded build from CPython 3.14 on.
 # * sdist.
 #
-# Nothing is published from here: the wheels are uploaded as workflow artifacts only.
+# On a `v*` tag, once every build and test job has passed, the `publish` job uploads the wheels
+# and the sdist to PyPI with trusted publishing (OIDC, no API token). Otherwise artifacts only.
 name: wheels
 
 on:
@@ -274,3 +275,31 @@ jobs:
           assert q.is_quantized() and q.predict("cherry coconut")[0] == ("__label__c",)
           print("smoke OK", p1)
           EOF
+
+  publish:
+    name: publish to PyPI
+    needs: [rust, fuzz, linux, macos, windows, sdist, test]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fasttext-new
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: tag matches the package version
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          ls -la dist
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              *-"$v"-*|*-"$v".tar.gz) ;;
+              *) echo "::error::$f does not match tag version $v"; exit 1 ;;
+            esac
+          done
+      - uses: pypa/gh-action-pypi-publish@release/v1

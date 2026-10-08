@@ -65,15 +65,19 @@ Version 0.1.0, **alpha**. The full feature set above is implemented. The complet
 including the comparisons with the C++ package, runs on Linux x86_64 (WSL2); Windows x86_64 was
 also tested by hand. In CI, every wheel (Linux x86_64 / aarch64, macOS x86_64 / arm64, Windows
 x86_64, abi3 and free-threaded 3.14t) is tested on its platform with about 250 tests that do not
-need the C++ package (see [Testing](#testing)). **macOS is tested in CI only; manual testing on
-Apple Silicon is still pending.** **Nothing is published on PyPI yet**, so install from source for
-now (see below). See [known differences](#known-differences) for what does not match the
+need the C++ package (see [Testing](#testing)). The test suite was also run by hand on Apple
+Silicon (macOS, M5 Pro). See [known differences](#known-differences) for what does not match the
 original.
 
 ## Installation
 
-You need a Rust toolchain (1.85 or newer, from [rustup](https://rustup.rs)) and Python 3.9 or
-newer.
+```bash
+pip install fasttext-new
+```
+
+Prebuilt wheels cover Linux x86_64 / aarch64, macOS x86_64 / arm64 and Windows x86_64, for
+CPython 3.9+ (abi3) and free-threaded 3.14t. To build from source you need a Rust toolchain
+(1.85 or newer, from [rustup](https://rustup.rs)) and Python 3.9 or newer:
 
 ```bash
 # Straight from GitHub (builds the extension with maturin)
@@ -87,9 +91,6 @@ pip install .                      # build and install a release wheel
 pip install maturin
 maturin develop --release          # build and install into the active virtualenv
 ```
-
-`pip install fasttext-new` will work once the package is published on PyPI. Wheels built by
-CI are available as workflow artifacts in the meantime.
 
 ## Quick start
 
@@ -266,7 +267,7 @@ lines. Its numbers depend a lot on the machine; run it on yours.
 | Linux x86_64, abi3 (CPython 3.9+) | CI and local | Full test suite, including the comparisons with the C++ package (locally and in the manual `reference` workflow); in CI, about 330 tests on every push |
 | Linux x86_64 / aarch64, free-threaded 3.14t | CI | About 310 tests, including thread scaling |
 | Linux aarch64, abi3 | CI | About 310 tests (golden C++ outputs, self-consistency, corrupt models) |
-| macOS x86_64 / arm64 (abi3 and 3.14t) | CI | About 310 tests per job; **not yet tested by hand on Apple Silicon** |
+| macOS x86_64 / arm64 (abi3 and 3.14t) | CI | About 310 tests per job; on Apple Silicon (M5 Pro) also by hand: 312 tests pass, plus the README examples |
 | Windows x86_64, abi3 and 3.14t | CI (MSVC); also cross-compiled with mingw-w64 (`scripts/build_windows_wheel.sh`) | About 310 tests in CI; tested by hand with the mingw build |
 
 The CI workflow ([`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)) builds abi3 and
@@ -385,8 +386,8 @@ before allocating, the loaded shapes are validated, and degenerate label counts 
 quadratic Huffman trees, zero labels) are rejected.
 
 **Platforms.** Linux x86_64 (WSL2) by hand and in CI; Windows x86_64 by hand (mingw build) and in
-CI (MSVC); Linux aarch64 and macOS x86_64 / arm64 in CI only. **Manual testing on Apple Silicon
-is pending.**
+CI (MSVC); macOS arm64 by hand (Apple Silicon, M5 Pro: 312 tests, `cargo test` and the README
+examples) and in CI; Linux aarch64 and macOS x86_64 in CI only.
 
 ## Project layout
 
